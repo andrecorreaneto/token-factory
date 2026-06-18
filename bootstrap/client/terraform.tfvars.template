@@ -1,0 +1,13 @@
+tenancy_ocid         = "ocid1.tenancy.oc1..replace-with-tenancy-ocid"
+user_ocid            = "ocid1.user.oc1..replace-with-user-ocid"
+fingerprint          = "19:42:ef:92:...:86:be:02:ba"
+private_key_path     = "replace-with-path-to-private-key-file"
+private_key_password = ""
+region               = "us-chicago-1"
+
+identity_domain_name            = "REPLACE_WITH_IDENTITY_DOMAIN_NAME"
+identity_domain_name_for_groups = null # Defaults to identity_domain_name.
+identity_domain_region          = "us-chicago-1"
+
+oci_secrets_compartment_ocid           = "ocid1.compartment.oc1..replace-with-secrets-compartment-ocid" # dbsec-security-cmp
+token_factory_runtime_compartment_ocid = "ocid1.compartment.oc1..replace-with-runtime-compartment-ocid" # the compartment where the TokenFactory library runs.
