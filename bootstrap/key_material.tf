@@ -1,17 +1,17 @@
-resource "tls_private_key" "jwt" {
-  count = local.create_generated_key_material ? 1 : 0
+resource "tls_private_key" "these" {
+  for_each = local.generated_key_material_components
 
   algorithm = "RSA"
   rsa_bits  = 2048
 }
 
-resource "tls_self_signed_cert" "jwt" {
-  count = local.create_generated_key_material ? 1 : 0
+resource "tls_self_signed_cert" "these" {
+  for_each = local.generated_key_material_components
 
-  private_key_pem = tls_private_key.jwt[0].private_key_pem
+  private_key_pem = tls_private_key.these[each.key].private_key_pem
 
   subject {
-    common_name  = "Token Factory"
+    common_name  = each.value.display_name
     organization = "Token Factory"
   }
 

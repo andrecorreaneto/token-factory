@@ -5,9 +5,72 @@ private_key_path     = "replace-with-path-to-private-key-file"
 private_key_password = ""
 region               = "us-chicago-1"
 
-identity_domain_name            = "REPLACE_WITH_IDENTITY_DOMAIN_NAME"
-identity_domain_name_for_groups = null # Defaults to identity_domain_name.
-identity_domain_region          = "us-chicago-1"
+identity_domain_url    = "https://replace-with-domain.identity.oraclecloud.com:443"
+identity_domain_region = "us-chicago-1"
+resource_name_prefix   = "token-factory"
 
-oci_secrets_compartment_ocid           = "ocid1.compartment.oc1..replace-with-secrets-compartment-ocid" # dbsec-security-cmp
-token_factory_runtime_compartment_ocid = "ocid1.compartment.oc1..replace-with-runtime-compartment-ocid" # the compartment where the TokenFactory library runs.
+enable_oci_secrets                     = true
+oci_secrets_compartment_ocid           = "ocid1.compartment.oc1..replace-with-secrets-compartment-ocid"
+restrict_secret_policy_to_secret_ocids = true
+output_provisioned_resources           = false
+
+# Optional existing Vault/key. Omit both to create shared Vault storage.
+# oci_vault_existing_ocid      = "ocid1.vault.oc1..replace-with-vault"
+# oci_master_key_existing_ocid = "ocid1.key.oc1..replace-with-master-key"
+
+# Optional authorization policy secret.
+# token_factory_authz_policy_secret_ocid = "ocid1.vaultsecret.oc1..replace-with-authz-policy-secret"
+
+# Production signed-envelope policy mode. The signing key is security-owned; this
+# wrapper only passes the trusted public verifier bundle to TokenFactory.
+# token_factory_authz_policy_signature_mode = "on"
+# token_factory_authz_policy_environment    = "prod"
+# emit_authz_policy_tenant_id               = false
+# token_factory_authz_policy_trusted_signers = [
+#   {
+#     key_id         = "ocid1.key.oc1..replace-with-security-owned-kms-key"
+#     key_version_id = "ocid1.keyversion.oc1..replace-with-security-owned-kms-key-version"
+#     algorithm      = "SHA_256_RSA_PKCS_PSS"
+#     public_key_pem = file("${path.module}/security-authz-policy-public-key.pem")
+#   }
+# ]
+
+oauth_apps = {
+  MCP_SERVER = {
+    # Optional. Defaults to "mcp-server" from the map key.
+    resource_name_prefix = null
+
+    display_name       = "mcp-server-token-factory-client"
+    description        = "OAuth client and resource-server config for MCP server."
+    issuer             = "https://mcp-server.example.com/token-factory"
+    kid                = "mcp-server-token-factory-cert"
+    resource_audiences = ["mcp-server"]
+    resource_scopes    = ["invoke"]
+    allowed_scopes     = []
+    app_roles          = []
+
+    runtime = {
+      principal_type   = "compute-instance"
+      compartment_ocid = "ocid1.compartment.oc1..replace-with-runtime-compartment-ocid"
+      resource_ocid    = "ocid1.instance.oc1..replace-with-compute-instance-ocid"
+      oci_auth_profile = null
+      oci_region       = null
+    }
+
+    enable_identity_propagation_trust = true
+    propagation_trust_claim_name      = "upstclient"
+    propagation_trust_claim_value     = "tokenexchange"
+
+    jwt_key_material_source = "generate"
+
+    jwt_private_key_pem                     = null
+    jwt_private_key_passphrase              = null
+    jwt_certificate_pem                     = null
+    jwt_certificate_pem_for_identity_domain = null
+
+    private_key_secret_existing_ocid            = null
+    private_key_passphrase_secret_existing_ocid = null
+    certificate_secret_existing_ocid            = null
+  }
+}
+

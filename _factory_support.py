@@ -26,6 +26,8 @@ from oci.identity_data_plane.models import GenerateScopedAccessTokenDetails
 from oci.secrets import SecretsClient
 from oci.signer import Signer
 
+from ._runtime_config import TokenFactoryRuntimeConfig
+
 
 _LOG_LEVELS = {
     "CRITICAL": logging.CRITICAL,
@@ -100,13 +102,13 @@ _ASSERTION_SIGNING_CERTIFICATE_SOURCE = None
 _TOKEN_EXCHANGE_CREDS_CACHE: Dict[
     Tuple[Optional[str], Optional[str], Optional[str], str, str], Tuple[str, str]
 ] = {}
-SUPPORTED_TARGET_TOOLS = (
+SUPPORTED_TOKEN_TYPES = (
     "oracle-database",
     "oci-service",
     "oauth",
     "userid",
 )
-TARGET_TOOLS_REQUIRING_SCOPE = ("oracle-database",)
+TOKEN_TYPES_REQUIRING_SCOPE = ("oracle-database", "oauth")
 OCI_IDENTITY_AUDIENCE = "https://identity.oraclecloud.com/"
 _ALLOWED_OCI_AUTH_MODES = {"instance-principal", "oci-profile", "resource-principal"}
 _OCI_AUTH_MODE_ERROR = "TOKEN_FACTORY_OCI_AUTH_MODE must be one of: instance-principal, oci-profile, resource-principal"
@@ -486,7 +488,7 @@ def _resolve_secret_region(secret_ocid: str, explicit_region: Optional[str]) -> 
     )
 
 
-def _get_factory_oci_signer(config: TokenFactoryConfig):
+def _get_factory_oci_signer(config: Any):
     _log_method_entry("_get_factory_oci_signer", oci_auth_mode=config.oci_auth_mode, oci_auth_profile=config.oci_auth_profile)
     if config.oci_auth_mode == "resource-principal":
         try:
@@ -529,7 +531,7 @@ def _get_factory_oci_signer(config: TokenFactoryConfig):
 
 
 def _fetch_secret_value_from_oci(
-    secret_ocid: str, region: Optional[str], config: TokenFactoryConfig
+    secret_ocid: str, region: Optional[str], config: Any
 ) -> str:
     _log_method_entry(
         "_fetch_secret_value_from_oci",
@@ -981,14 +983,22 @@ def _exchange_assertion_for_oauth(assertion: str, scope: Optional[str], config: 
     return data
 
 
-def _generate_db_token_with_dataplane(signer: Any, public_key_pem: str, scope: str, config: TokenFactoryConfig) -> str:
-    _log_method_entry("_generate_db_token_with_dataplane", signer_type=type(signer).__name__, public_key_present=bool(public_key_pem), scope=scope, domain_region=config.domain_oci_region)
+def _generate_db_token_with_dataplane(
+    signer: Any,
+    public_key_pem: str,
+    scope: str,
+    config: TokenFactoryRuntimeConfig,
+) -> str:
+    domain_region = getattr(config, "domain_region", None)
+    if not domain_region:
+        raise ConfigurationError("TokenFactory domain region is required for database token generation.")
+    _log_method_entry("_generate_db_token_with_dataplane", signer_type=type(signer).__name__, public_key_present=bool(public_key_pem), scope=scope, domain_region=domain_region)
     LOGGER.info(
         "Requesting Oracle Database scoped access token domain_region=%s scope=%s.",
-        config.domain_oci_region,
+        domain_region,
         _truncate_for_log(scope, 120),
     )
-    client = DataplaneClient(config={"region": config.domain_oci_region}, signer=signer)
+    client = DataplaneClient(config={"region": domain_region}, signer=signer)
     details = GenerateScopedAccessTokenDetails(
         scope=scope,
         public_key=public_key_pem,
@@ -999,16 +1009,16 @@ def _generate_db_token_with_dataplane(signer: Any, public_key_pem: str, scope: s
     return response.data.token
 
 
-def _resolve_jwt_assertion_audience(config: TokenFactoryConfig, target_tool: str) -> str:
-    _log_method_entry("_resolve_jwt_assertion_audience", target_tool=target_tool, domain=config.domain_url)
-    if target_tool in ("oracle-database", "oci-service"):
+def _resolve_jwt_assertion_audience(config: TokenFactoryConfig, token_type: str) -> str:
+    _log_method_entry("_resolve_jwt_assertion_audience", token_type=token_type, domain=config.domain_url)
+    if token_type in ("oracle-database", "oci-service"):
         return f"{config.domain_url}/oauth2/v1/token"
-    if target_tool in ("oauth", "userid"):
+    if token_type in ("oauth", "userid"):
         return OCI_IDENTITY_AUDIENCE
 
-    supported = ", ".join(SUPPORTED_TARGET_TOOLS)
+    supported = ", ".join(SUPPORTED_TOKEN_TYPES)
     raise ValueError(
-        f"Unsupported target_tool '{target_tool}' for JWT assertion. Supported values: {supported}"
+        f"Unsupported token_type '{token_type}' for JWT assertion. Supported values: {supported}"
     )
 
 
@@ -1035,9 +1045,9 @@ def _resolve_jwt_assertion_x5t(config: TokenFactoryConfig) -> Optional[str]:
     return base64.urlsafe_b64encode(thumbprint).rstrip(b"=").decode("utf-8")
 
 
-def _resolve_jwt_assertion_header_claims(config: TokenFactoryConfig, target_tool: str) -> Dict[str, str]:
-    _log_method_entry("_resolve_jwt_assertion_header_claims", target_tool=target_tool, kid_configured=bool(config.assertion_kid))
-    if target_tool in ("oauth", "userid"):
+def _resolve_jwt_assertion_header_claims(config: TokenFactoryConfig, token_type: str) -> Dict[str, str]:
+    _log_method_entry("_resolve_jwt_assertion_header_claims", token_type=token_type, kid_configured=bool(config.assertion_kid))
+    if token_type in ("oauth", "userid"):
         if config.assertion_kid:
             return {"kid": config.assertion_kid}
 
@@ -1047,7 +1057,7 @@ def _resolve_jwt_assertion_header_claims(config: TokenFactoryConfig, target_tool
 
         LOGGER.info(
             "No x5t or kid is configured for %s; Falling back to identity domain SIGNING_KEY alias.",
-            target_tool,
+            token_type,
         )
         return {}
 
@@ -1066,9 +1076,9 @@ def _parse_propagation_trust_claim(raw_value: str) -> Tuple[str, str]:
     return claim_name, claim_value
 
 
-def _resolve_propagation_trust_claim(config: TokenFactoryConfig, target_tool: str) -> Dict[str, str]:
-    _log_method_entry("_resolve_propagation_trust_claim", target_tool=target_tool, configured=bool(config.propagation_trust_claim))
-    if target_tool not in ("oracle-database", "oci-service"):
+def _resolve_propagation_trust_claim(config: TokenFactoryConfig, token_type: str) -> Dict[str, str]:
+    _log_method_entry("_resolve_propagation_trust_claim", token_type=token_type, configured=bool(config.propagation_trust_claim))
+    if token_type not in ("oracle-database", "oci-service"):
         return {}
     if not config.propagation_trust_claim:
         return {}
@@ -1077,12 +1087,12 @@ def _resolve_propagation_trust_claim(config: TokenFactoryConfig, target_tool: st
     return {claim_name: claim_value}
 
 
-def build_jwt_assertion(incoming_access_token: str, config: TokenFactoryConfig, target_tool: str) -> str:
-    _log_method_entry("build_jwt_assertion", target_tool=target_tool, domain=config.domain_url, credential_kind="access_token")
+def build_jwt_assertion(incoming_access_token: str, config: TokenFactoryConfig, token_type: str) -> str:
+    _log_method_entry("build_jwt_assertion", token_type=token_type, domain=config.domain_url, credential_kind="access_token")
     now = int(time.time())
-    header_claims = _resolve_jwt_assertion_header_claims(config, target_tool)
-    audience = _resolve_jwt_assertion_audience(config, target_tool)
-    propagation_trust_claim = _resolve_propagation_trust_claim(config, target_tool)
+    header_claims = _resolve_jwt_assertion_header_claims(config, token_type)
+    audience = _resolve_jwt_assertion_audience(config, token_type)
+    propagation_trust_claim = _resolve_propagation_trust_claim(config, token_type)
     payload = {
         "iss": config.jwt_issuer,
         "sub": _extract_subject(incoming_access_token),
@@ -1095,8 +1105,8 @@ def build_jwt_assertion(incoming_access_token: str, config: TokenFactoryConfig, 
     header = {"alg": "RS256", "typ": "JWT"}
     header.update(header_claims)
     LOGGER.info(
-        "Building JWT assertion target_tool=%s audience=%s header_claims=%s propagation_claims=%s.",
-        target_tool,
+        "Building JWT assertion token_type=%s audience=%s header_claims=%s propagation_claims=%s.",
+        token_type,
         audience,
         ",".join(sorted(header_claims.keys())) if header_claims else "none",
         ",".join(sorted(propagation_trust_claim.keys())) if propagation_trust_claim else "none",
@@ -1137,8 +1147,8 @@ __all__ = [
     "ConfigurationError",
     "LOGGER",
     "OCI_IDENTITY_AUDIENCE",
-    "SUPPORTED_TARGET_TOOLS",
-    "TARGET_TOOLS_REQUIRING_SCOPE",
+    "SUPPORTED_TOKEN_TYPES",
+    "TOKEN_TYPES_REQUIRING_SCOPE",
     "TokenExchangeError",
     "TokenFactoryConfig",
     "_exchange_assertion_for_oauth",
