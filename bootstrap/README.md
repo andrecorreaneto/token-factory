@@ -1,13 +1,20 @@
 # Token Factory Bootstrap
 
-Terraform bootstrap for the infrastructure Token Factory needs when it is embedded in one or more hosting applications.
+This Terraform module provisions the OCI and Identity Domain prerequisites for [Token Factory](../README.md). It outputs the runtime configuration that hosting applications plug into their environment.
 
-Token Factory is not the OAuth client. Each hosting application is both:
+It is recommended to run this module from the [client folder](./client/), which contains a runnable example driven from [terraform.tfvars.template](./client/terraform.tfvars.template).
 
-- the OAuth confidential client used for outbound token exchange, introspection authentication, and UPST-backed flows;
-- the resource-server boundary for incoming end-user access tokens.
+This module manages:
 
-This module provisions shared Token Factory storage/config plus any number of hosting application OAuth app configurations from one state file.
+- Shared Token Factory runtime configuration.
+- One Identity Domain confidential OAuth client per `oauth_apps` entry.
+- Identity Domain OAuth partner certificates.
+- Optional IdentityPropagationTrust resources.
+- Optional generated JWT private keys and self-signed certificates.
+- Optional OCI Vault, master key, and secrets.
+- Runtime IAM principals: dynamic groups or user groups.
+- IAM policies granting `read secret-bundle` to runtime principals.
+- `TOKEN_FACTORY_*`, OAuth client resolver config, and resource OCID outputs.
 
 ## Mental Model
 
@@ -15,129 +22,50 @@ This module provisions shared Token Factory storage/config plus any number of ho
 shared Token Factory config + N oauth_apps entries = Token Factory bootstrap
 ```
 
-Shared resources are created once:
+Token Factory is not the OAuth client. Each hosting application is both:
 
-- optional shared OCI Vault;
-- optional shared Vault master key;
-- authorization policy runtime config;
-- common Identity Domain/runtime environment values.
+- the OAuth confidential client used for outbound token exchange, introspection authentication, and UPST-backed flows;
+- the resource-server boundary for incoming end-user access tokens.
 
-OAuth app/runtime resources are created once per `oauth_apps` entry:
+Adding a new hosting application should be additive: add one `oauth_apps` entry and apply.
 
-- Identity Domain confidential OAuth app with OAuth introspection enabled;
-- configured Identity Domain application-role grants;
-- OAuth partner certificate;
-- optional IdentityPropagationTrust;
-- runtime IAM principal wrapper;
-- runtime Vault read policy;
-- OAuth client credentials/private key/certificate secrets.
-
-Adding a new hosting application later should be an additive change: add one `oauth_apps` entry and apply.
-
-## Example
-
-```hcl
-module "token_factory_bootstrap" {
-  source = "../token-factory-bootstrap"
-
-  tenancy_ocid           = var.tenancy_ocid
-  region                 = "us-ashburn-1"
-  identity_domain_url    = "https://idcs-example.identity.oraclecloud.com"
-  identity_domain_region = "us-ashburn-1"
-  resource_name_prefix   = "token-factory"
-
-  enable_oci_secrets                     = true
-  oci_secrets_compartment_ocid           = "ocid1.compartment.oc1..secrets"
-  oci_vault_existing_ocid                = "ocid1.vault.oc1.iad..."
-  oci_master_key_existing_ocid           = "ocid1.key.oc1.iad..."
-  restrict_secret_policy_to_secret_ocids = true
-
-  token_factory_authz_policy_secret_ocid    = "ocid1.vaultsecret.oc1.iad...authz"
-  token_factory_authz_policy_signature_mode = "on"
-  token_factory_authz_policy_environment    = "dev"
-  token_factory_authz_policy_trusted_signers = [
-    {
-      key_id         = "ocid1.key.oc1.iad..."
-      key_version_id = "ocid1.keyversion.oc1.iad..."
-      algorithm      = "SHA_256_RSA_PKCS_PSS"
-      public_key_pem = <<EOT
------BEGIN PUBLIC KEY-----
-...
------END PUBLIC KEY-----
-EOT
-    }
-  ]
-
-  oauth_apps = {
-    MCP_SERVER = {
-      display_name       = "mcp-server-token-factory-client"
-      description        = "OAuth client and resource-server config for MCP server."
-      issuer             = "https://mcp-server.example.com/token-factory"
-      kid                = "mcp-server-token-factory-cert"
-      resource_audiences = ["mcp-server"]
-      resource_scopes    = ["invoke"]
-      allowed_scopes     = []
-      app_roles          = []
-
-      runtime = {
-        principal_type   = "compute-instance"
-        compartment_ocid = "ocid1.compartment.oc1..runtime"
-        resource_ocid    = "ocid1.instance.oc1.iad..."
-        oci_auth_profile = null
-        oci_region       = null
-      }
-
-      enable_identity_propagation_trust = true
-      propagation_trust_claim_name      = "upstclient"
-      propagation_trust_claim_value     = "tokenexchange"
-
-      jwt_key_material_source = "generate"
-
-      jwt_private_key_pem                     = null
-      jwt_private_key_passphrase              = null
-      jwt_certificate_pem                     = null
-      jwt_certificate_pem_for_identity_domain = null
-
-      private_key_secret_existing_ocid            = null
-      private_key_passphrase_secret_existing_ocid = null
-      certificate_secret_existing_ocid            = null
-    }
-  }
-}
-```
-
-## Important Inputs
+## Module Inputs
 
 ### Shared Inputs
 
-| Input | Default | Description |
-|---|---:|---|
-| `tenancy_ocid` | required | OCI tenancy OCID. |
-| `region` | `null` | OCI provider region. Defaults to `identity_domain_region`. |
-| `resource_name_prefix` | `"token-factory"` | Prefix for shared Token Factory resources only. `null` or `""` falls back to `"token-factory"`. |
-| `identity_domain_url` | required | Identity Domain base URL. |
-| `identity_domain_region` | required | Identity Domain/OCI region. |
-| `enable_oci_secrets` | `true` | Store OAuth app material in OCI Vault. |
-| `oci_secrets_compartment_ocid` | `null` | Compartment for Vault secrets and runtime secret-read policies. |
-| `oci_vault_existing_ocid` | `null` | Existing Vault OCID. If omitted and secrets are enabled, the module creates `oci_kms_vault.this`. |
-| `oci_master_key_existing_ocid` | `null` | Existing key OCID. If omitted and secrets are enabled, the module creates `oci_kms_key.this`. |
-| `restrict_secret_policy_to_secret_ocids` | `false` | Restrict each runtime policy to exact secret OCIDs. |
+| Variable | Type | Default | Required? | Description |
+| --- | --- | --- | --- | --- |
+| `region` | `string` | `null` | No | OCI provider region. Defaults to `identity_domain_region` when omitted. |
+| `tenancy_ocid` | `string` | None | Yes | Tenancy OCID where IAM dynamic groups, groups, and policies are created. |
+| `user_ocid` | `string` | `null` | No | Optional OCI API-key user OCID for local Terraform runs. |
+| `fingerprint` | `string` | `null` | No | Optional OCI API-key fingerprint for local Terraform runs. |
+| `private_key_path` | `string` | `null` | No | Optional OCI API private key path for local Terraform runs. |
+| `private_key_password` | `string` | `null` | No | Optional OCI API private key password for local Terraform runs. Sensitive. |
+| `resource_name_prefix` | `string` | `"token-factory"` | No | Prefix for shared Token Factory resource names. `null` or empty falls back to `token-factory`. |
+| `identity_domain_url` | `string` | None | Yes | Identity Domain base URL. |
+| `identity_domain_region` | `string` | None | Yes | OCI region used for token exchange and Identity Domain data-plane calls. |
+| `enable_oci_secrets` | `bool` | `true` | No | When true, store OAuth app material in OCI Secrets and output secret OCIDs. |
+| `oci_secrets_compartment_ocid` | `string` | `null` | Conditional | Compartment for created or existing OCI Secrets and runtime secret-read policies. Required when secrets are enabled. |
+| `oci_vault_existing_ocid` | `string` | `null` | No | Existing Vault OCID. When omitted and secrets are enabled, the module provisions a Vault. |
+| `oci_master_key_existing_ocid` | `string` | `null` | No | Existing Vault master key OCID. When omitted and secrets are enabled, the module provisions a key. |
+| `oci_secrets_region` | `string` | `null` | No | Fallback OCI Secrets region for runtime config. Defaults to `identity_domain_region` when omitted. |
+| `restrict_secret_policy_to_secret_ocids` | `bool` | `false` | No | When true, generated Vault read policies include where clauses for individual secret OCIDs. |
 
 ### Runtime Config Inputs
 
-| Input | Default | Runtime output |
-|---|---:|---|
-| `token_factory_timeout_seconds` | `30` | `TOKEN_FACTORY_TIMEOUT_SECONDS` |
-| `token_factory_subject_claim` | `"sub"` | `TOKEN_FACTORY_SUBJECT_CLAIM` |
-| `token_factory_groups_claim` | `"groups"` | `TOKEN_FACTORY_GROUPS_CLAIM` |
-| `token_factory_log_full_assertion` | `false` | `TOKEN_FACTORY_LOG_FULL_ASSERTION`, only when true |
-| `token_factory_authz_policy_secret_ocid` | `null` | `TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID` |
-| `token_factory_authz_policy_signature_mode` | `"off"` | `TOKEN_FACTORY_AUTHZ_POLICY_SIGNATURE_MODE` |
-| `token_factory_authz_policy_trusted_signers` | `[]` | `TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON` |
-| `token_factory_authz_policy_environment` | `null` | `TOKEN_FACTORY_AUTHZ_POLICY_ENVIRONMENT` |
-| `emit_authz_policy_tenant_id` | `false` | `TOKEN_FACTORY_AUTHZ_POLICY_TENANT_ID = tenancy_ocid`, only when true |
+| Variable | Type | Default | Runtime output |
+| --- | --- | --- | --- |
+| `token_factory_timeout_seconds` | `number` | `30` | `TOKEN_FACTORY_TIMEOUT_SECONDS` |
+| `token_factory_subject_claim` | `string` | `"sub"` | `TOKEN_FACTORY_SUBJECT_CLAIM` |
+| `token_factory_groups_claim` | `string` | `"group"` | `TOKEN_FACTORY_GROUPS_CLAIM` |
+| `token_factory_log_full_assertion` | `bool` | `false` | `TOKEN_FACTORY_LOG_FULL_ASSERTION`, only when true |
+| `token_factory_authz_policy_secret_ocid` | `string` | `null` | `TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID` |
+| `token_factory_authz_policy_signature_mode` | `string` | `"off"` | `TOKEN_FACTORY_AUTHZ_POLICY_SIGNATURE_MODE` |
+| `token_factory_authz_policy_trusted_signers` | `list(object)` | `[]` | `TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON` |
+| `token_factory_authz_policy_environment` | `string` | `null` | `TOKEN_FACTORY_AUTHZ_POLICY_ENVIRONMENT` |
+| `emit_authz_policy_tenant_id` | `bool` | `false` | `TOKEN_FACTORY_AUTHZ_POLICY_TENANT_ID`, only when true |
 
-`token_factory_authz_policy_trusted_signers` entries must have this shape:
+`token_factory_authz_policy_trusted_signers` entries have this shape:
 
 ```hcl
 {
@@ -152,163 +80,144 @@ The module does not create the authorization matrix signing key. That key is sec
 
 ### OAuth App Inputs
 
-`oauth_apps` is a map. Each entry represents one hosting application's Identity Domain OAuth confidential app plus the runtime/IAM/secret configuration Token Factory needs to use that app. The map key is the canonical Token Factory `CallerContext.client_key` and must be uppercase.
+`oauth_apps` is a map. Each entry represents one hosting application's Identity Domain OAuth confidential app and the runtime configuration Token Factory needs to use it.
 
-The module emits `oauth_app_configs` in the Python `OAuthClientInfo` shape for Vault-backed deployments, keyed by the same `CallerContext.client_key`. Inline/raw credential deployments use the sensitive `oauth_app_sensitive_configs` outputs.
+Map keys are the canonical Token Factory `CallerContext.client_key` values and must be uppercase.
 
-| Field | Description |
-|---|---|
-| `resource_name_prefix` | Optional prefix for this OAuth app's resources. Defaults to the normalized map key, for example `MCP_SERVER` becomes `mcp-server`. |
-| `display_name` | Identity Domain confidential app display name. |
-| `description` | Identity Domain confidential app description. |
-| `issuer` | JWT assertion issuer for this OAuth app/client identity. |
-| `kid` | JWT key ID and OAuth partner certificate alias. |
-| `resource_audiences` | Accepted incoming token audiences for this hosting app/resource server. |
-| `resource_scopes` | Required incoming Identity Domain resource-server scopes. Non-empty values make the Identity Domain app an OAuth resource. The output maps this to Token Factory `required_incoming_scopes`. |
-| `allowed_scopes` | OAuth client authorized scopes for the Identity Domain app. Defaults to `[]`. Values must be Identity Domain FQS strings. |
-| `app_roles` | Identity Domain app-role grants for the OAuth app. Defaults to `[]`. |
-| `runtime.principal_type` | `compute-instance`, `oci-function`, `oke-cluster`, or `user-group`. |
-| `runtime.compartment_ocid` | Compartment for dynamic group matching or group/policy placement. |
-| `runtime.resource_ocid` | Optional exact compute/function/cluster OCID. |
-| `runtime.oci_auth_profile` | Used only when `principal_type = "user-group"`; defaults to `DEFAULT` in runtime config. |
-| `runtime.oci_region` | Per-runtime `TOKEN_FACTORY_OCI_REGION`; falls back to `oci_secrets_region` or `identity_domain_region`. |
-| `enable_identity_propagation_trust` | Create IdentityPropagationTrust for `oracle-database` and `oci-service` UPST flows. |
-| `propagation_trust_claim_name` / `propagation_trust_claim_value` | Optional trust client claim pair. |
-| `jwt_key_material_source` | `generate`, `provided_pem`, or `existing_secret_ocids`. |
-| `jwt_private_key_pem` / `jwt_certificate_pem` | Required when `jwt_key_material_source = "provided_pem"`. |
-| `jwt_certificate_pem_for_identity_domain` | Required when `jwt_key_material_source = "existing_secret_ocids"`. |
-| `private_key_secret_existing_ocid` / `certificate_secret_existing_ocid` | Required when `jwt_key_material_source = "existing_secret_ocids"`. |
-| `private_key_passphrase_secret_existing_ocid` | Optional existing passphrase secret. |
+| Field | Required? | Description |
+| --- | --- | --- |
+| `resource_name_prefix` | No | Optional prefix for this app's resources. Defaults to the normalized map key, for example `MCP_SERVER` becomes `mcp-server`. |
+| `display_name` | Yes | Identity Domain confidential app display name. |
+| `description` | No | Identity Domain confidential app description. |
+| `issuer` | Yes | JWT assertion issuer for this OAuth app/client identity. |
+| `kid` | Yes | JWT key ID and OAuth partner certificate alias. |
+| `resource_audiences` | Yes | Accepted incoming token audiences for this hosting app/resource server. |
+| `resource_scopes` | No | Incoming Identity Domain resource-server scopes. Non-empty values make the Identity Domain app an OAuth resource. |
+| `allowed_scopes` | No | OAuth client authorized scopes for the Identity Domain app. Values must be Identity Domain FQS strings. |
+| `app_roles` | No | Identity Domain app-role grants for the OAuth app. Defaults to no grants. |
+| `runtime.principal_type` | Yes | `compute-instance`, `oci-function`, `oke-cluster`, or `user-group`. |
+| `runtime.compartment_ocid` | Yes | Compartment for dynamic group matching or group/policy placement. |
+| `runtime.resource_ocid` | No | Optional exact compute instance, OCI Function, or OKE cluster OCID. |
+| `runtime.oci_auth_profile` | No | Used only when `principal_type = "user-group"`; defaults to `DEFAULT` in runtime config. |
+| `runtime.oci_region` | No | Per-runtime `TOKEN_FACTORY_OCI_REGION`; falls back to `oci_secrets_region` or `identity_domain_region`. |
+| `enable_identity_propagation_trust` | No | Create IdentityPropagationTrust for `oracle-database` and `oci-service` UPST flows. Defaults to true. |
+| `propagation_trust_claim_name` | No | Optional trust client claim name. Must be set with `propagation_trust_claim_value`. |
+| `propagation_trust_claim_value` | No | Optional trust client claim value. Must be set with `propagation_trust_claim_name`. |
+| `jwt_key_material_source` | No | `generate`, `provided_pem`, or `existing_secret_ocids`. Defaults to `generate`. |
+| `jwt_private_key_pem` | Conditional | Private key PEM. Required when `jwt_key_material_source = "provided_pem"`. Sensitive. |
+| `jwt_private_key_passphrase` | No | Optional private key passphrase. Sensitive. |
+| `jwt_certificate_pem` | Conditional | Certificate PEM. Required when `jwt_key_material_source = "provided_pem"`. Sensitive. |
+| `jwt_certificate_pem_for_identity_domain` | Conditional | Public certificate PEM for Identity Domains when using existing secret OCIDs. |
+| `private_key_secret_existing_ocid` | Conditional | Existing private key secret OCID when `jwt_key_material_source = "existing_secret_ocids"`. |
+| `private_key_passphrase_secret_existing_ocid` | No | Optional existing private key passphrase secret OCID. |
+| `certificate_secret_existing_ocid` | Conditional | Existing certificate secret OCID when `jwt_key_material_source = "existing_secret_ocids"`. |
 
-Supported `app_roles` values are `Me`, `Approval Workflow Administrator`, `Identity Domain Administrator`, `Reset Password`, `User Manager`, `User Administrator`, `Kerberos Administrator`, `Verify Email`, `Change Password`, `Posix Viewer`, `DB Administrator`, `Me Password Validator`, `Digitalid Wallet`, `Digitalid Verifier`, `Digitalid Issuer`, `Digitalid Admin`, `Help Desk Administrator`, `Audit Administrator`, `MFA Client`, `Security Administrator`, `Authenticator Client`, `Self Registration`, `Cloud Gate`, `Forgot Password`, `Signin`, and `Application Administrator`.
+Supported `app_roles` values are Identity Domain app role display names validated by the module, such as `Me`, `User Administrator`, `Security Administrator`, and `Application Administrator`.
 
-Derived runtime auth mode:
+## Resource Name Prefix
 
-| `runtime.principal_type` | `TOKEN_FACTORY_OCI_AUTH_MODE` |
-|---|---|
-| `compute-instance` | `instance-principal` |
-| `oci-function` | `resource-principal` |
-| `oke-cluster` | `resource-principal` |
-| `user-group` | `oci-profile` |
+The top-level `resource_name_prefix` defaults to `token-factory`. It affects shared resources only.
 
-## Outputs
+| Resource | Generated value with default prefix | When it applies |
+| --- | --- | --- |
+| `oci_kms_vault.this` | `token-factory-vault` | When `enable_oci_secrets = true` and `oci_vault_existing_ocid = null`. |
+| `oci_kms_key.this` | `token-factory-master-key` | When `enable_oci_secrets = true` and `oci_master_key_existing_ocid = null`. |
+
+Per-app resources use `oauth_apps[*].resource_name_prefix`. When it is omitted, the module normalizes the `oauth_apps` map key.
+
+For `MCP_SERVER`, the default per-app prefix is `mcp-server`.
+
+| Resource | Example generated value | When it applies |
+| --- | --- | --- |
+| `oci_identity_domains_app.these` | `mcp-server-client` | For each `oauth_apps` entry. |
+| `oci_identity_domains_identity_propagation_trust.these` | `mcp-server-identity-propagation-trust` | When propagation trust is enabled for the app. |
+| `oci_identity_dynamic_group.these` | `mcp-server-runtime-dynamic-group` | For compute, function, and OKE runtimes. |
+| `oci_identity_group.these` | `mcp-server-runtime-user-group` | For `user-group` runtimes. |
+| `oci_identity_policy.these` | `mcp-server-secrets-policy` | For each app runtime. |
+| `oci_vault_secret.client_credentials` | `mcp-server-client-credentials-secret` | When `enable_oci_secrets = true`. |
+| `oci_vault_secret.private_keys` | `mcp-server-jwt-private-key-secret` | When secrets are enabled and key material is generated or provided. |
+| `oci_vault_secret.private_key_passphrases` | `mcp-server-jwt-private-key-passphrase-secret` | When a passphrase secret is needed. |
+| `oci_vault_secret.certificates` | `mcp-server-jwt-certificate-secret` | When secrets are enabled and key material is generated or provided. |
+
+## Module Outputs
 
 | Output | Description |
-|---|---|
+| --- | --- |
 | `token_factory_shared_runtime_config` | Shared runtime config base. Excludes OAuth app identity fields and per-runtime OCI auth values. |
-| `token_factory_runtime_configs` | Full runtime config map by OAuth app key. |
-| `token_factory_runtime_config_env` | Shell `export` lines by OAuth app key. |
-| `oauth_app_configs` | Token Factory `OAuthClientInfo`-shaped resolver config by OAuth app key. Regular output contains only non-secret values and secret OCID references. |
-| `oauth_app_configs_json` | JSON-encoded resolver config for Vault-backed application deployment. Regular output contains only non-secret values and secret OCID references. |
-| `oauth_app_sensitive_configs` | Sensitive `OAuthClientInfo`-shaped resolver config including inline credentials and PEM values when `enable_oci_secrets = false`. |
-| `oauth_app_sensitive_configs_json` | Sensitive JSON-encoded resolver config including inline credentials and PEM values when `enable_oci_secrets = false`. |
+| `token_factory_runtime_configs` | Full Token Factory runtime configuration by OAuth app key. |
+| `token_factory_runtime_config_env` | Shell `export` lines for runtime configuration by OAuth app key. |
+| `oauth_app_configs` | Non-sensitive `OAuthClientInfo`-shaped resolver config by OAuth app key. Contains secret OCID references, not inline secrets. |
+| `oauth_app_configs_json` | JSON-encoded non-sensitive resolver config for Vault-backed deployments. |
+| `oauth_app_sensitive_configs` | Sensitive resolver config including inline credentials and PEM values when `enable_oci_secrets = false`. |
+| `oauth_app_sensitive_configs_json` | JSON-encoded sensitive resolver config for direct-value deployments. |
 | `oauth_app_runtime_secret_ocids` | OAuth material secret OCIDs each OAuth app runtime must read. |
 | `runtime_secret_ocids` | Authz policy secret plus OAuth app secret OCIDs by OAuth app key. |
 | `runtime_principals` | Runtime IAM principal details by OAuth app key. |
 | `secret_policy_statements` | Generated Vault read policy statements by OAuth app key. |
-| `oauth_app_resource_ids` | App, app-role grant, cert, trust, IAM, and secret IDs by OAuth app key. |
+| `oauth_app_resource_ids` | App, grant, certificate, trust, IAM, and secret IDs by OAuth app key. |
 | `provisioned_resource_ids` | Combined shared and OAuth app/runtime resource IDs. |
 | `provisioned_resources` | Shared and OAuth app/runtime resources with names and OCIDs for lookup. |
 
-Regular outputs intentionally avoid inline credentials and PEM values. The inline/raw resolver outputs are explicitly marked sensitive.
+Regular outputs intentionally avoid inline credentials and PEM values. Direct-value resolver outputs are marked sensitive.
 
-## Runtime Use On OCI Compute
+## Vault and Secrets
 
-After apply, export the runtime config for the OAuth app key that runs on the compute instance:
+Vault-backed mode is the default. Set `enable_oci_secrets = true` and provide `oci_secrets_compartment_ocid`.
 
-```powershell
-terraform output -raw token_factory_runtime_config_env
+The module can create a Vault and master key, or use existing ones:
+
+```hcl
+oci_vault_existing_ocid      = var.vault_ocid
+oci_master_key_existing_ocid = var.master_key_ocid
 ```
 
-For a map output, select the relevant key:
+To use an existing Vault but let the module create a new master key in it:
 
-```powershell
-terraform output -json token_factory_runtime_config_env
+```hcl
+oci_vault_existing_ocid = var.vault_ocid
 ```
 
-For the normal Vault-backed path, save `oauth_app_configs_json` into application config. The application loads it into Token Factory's resolver:
+Providing `oci_master_key_existing_ocid` without `oci_vault_existing_ocid` is invalid.
 
-```python
-import json
-from token_factory import OAuthClientInfo, TokenFactory, VaultOAuthClientResolver
+Vault-backed deployments should use `oauth_app_configs_json`. The output contains resolver config with secret OCID references.
 
-with open("oauth_app_configs.json", "r", encoding="utf-8") as handle:
-    raw_config = json.load(handle)
+Direct-value deployments set `enable_oci_secrets = false` and use `oauth_app_sensitive_configs_json`. Terraform redacts that output by default.
 
-client_info = {
-    client_key: OAuthClientInfo(**config)
-    for client_key, config in raw_config.items()
-}
+## Key Material Sources
 
-factory = TokenFactory(
-    oauth_client_resolver=VaultOAuthClientResolver(client_info=client_info),
-)
-```
+`jwt_key_material_source` is configured per OAuth app.
 
-For local/dev deployments with `enable_oci_secrets = false`, use `oauth_app_sensitive_configs_json` instead. Terraform will redact that output by default; retrieve it intentionally with:
+Supported values:
 
-```powershell
-terraform output -raw oauth_app_sensitive_configs_json
-```
+- `generate`: Terraform generates an RSA private key and self-signed certificate.
+- `provided_pem`: callers provide `jwt_private_key_pem` and `jwt_certificate_pem`.
+- `existing_secret_ocids`: callers provide existing private key and certificate secret OCIDs plus `jwt_certificate_pem_for_identity_domain`.
 
-The app should pass the matching `CallerContext.client_key` when calling Token Factory:
+When `enable_oci_secrets = false`, OCI secrets, runtime IAM groups, and runtime IAM policies are not created. In direct-value mode, Token Factory does not need OCI IAM access just to load its own configuration.
 
-```python
-from token_factory import CallerContext
+## Runtime IAM
 
-result = factory.get_token(
-    credential=end_user_access_token,
-    target_tool="oauth",
-    scope="urn:opc:idm:example.read",
-    caller_context=CallerContext(client_key="mcp_server"),
-)
-```
+Runtime IAM is configured per OAuth app with `oauth_apps[*].runtime.principal_type`.
 
-## Resource Naming
+| `runtime.principal_type` | `TOKEN_FACTORY_OCI_AUTH_MODE` | Principal created |
+| --- | --- | --- |
+| `compute-instance` | `instance-principal` | Dynamic group |
+| `oci-function` | `resource-principal` | Dynamic group |
+| `oke-cluster` | `resource-principal` | Dynamic group |
+| `user-group` | `oci-profile` | User group |
 
-Singleton shared resources use `this`:
+Set `runtime.compartment_ocid` for every app. Optionally set `runtime.resource_ocid` to restrict dynamic group matching to one compute instance, OKE cluster, or OCI Function.
 
-- `oci_kms_vault.this`
-- `oci_kms_key.this`
+For `user-group`, the module creates the group and policy but does not manage user membership. Add the intended API-key user through your normal IAM process.
 
-Shared resource names use the top-level `resource_name_prefix`, defaulting to `token-factory`:
+## Security Notes
 
-- `token-factory-vault`
-- `token-factory-master-key`
+Generated and provided private key material is stored in Terraform state. Prefer Vault-backed mode for production.
 
-Per-app resource names use `oauth_apps[*].resource_name_prefix`, defaulting to the normalized `oauth_apps` map key:
+Use `jwt_key_material_source = "existing_secret_ocids"` when Terraform should not handle raw private key material.
 
-- `mcp-server-client`
-- `mcp-server-identity-propagation-trust`
-- `mcp-server-runtime-dynamic-group`
-- `mcp-server-secrets-policy`
+`resource_scopes` are incoming resource-server scopes for the hosting application. They are not downstream scopes requested from target tools.
 
-Keyed OAuth app/runtime resources use `these`:
+`allowed_scopes` are the OAuth client scopes authorized on the Identity Domain app. Pass Identity Domain FQS strings directly.
 
-- `oci_identity_dynamic_group.these`
-- `oci_identity_group.these`
-- `oci_identity_policy.these`
-- `oci_identity_domains_app.these`
-- `oci_identity_domains_grant.these`
-- `oci_identity_domains_oauth_partner_certificate.these`
-- `oci_identity_domains_identity_propagation_trust.these`
-- `tls_private_key.these`
-- `tls_self_signed_cert.these`
-
-Grouped OAuth material secrets use descriptive plural names:
-
-- `oci_vault_secret.client_credentials`
-- `oci_vault_secret.private_keys`
-- `oci_vault_secret.private_key_passphrases`
-- `oci_vault_secret.certificates`
-
-## Notes
-
-- Generated and provided private key material is stored in Terraform state. Use `existing_secret_ocids` when Terraform should not handle raw private key material.
-- `resource_scopes` are incoming resource-server scopes for the hosting application, not downstream scopes requested from target tools.
-- `allowed_scopes` are the OAuth client scopes authorized on the Identity Domain app. Pass Identity Domain FQS strings directly.
-- `app_roles = []` disables Identity Domain app-role grants for that OAuth app.
-- Downstream target-tool authorization is controlled by the Token Factory authorization policy secret.
-- The legacy `client/` folder predates this super-module shape. Prefer the root module documented here for new infrastructure.
-
-
+Downstream target-tool authorization is optionally controlled by security policy in the Token Factory authorization policy secret.

@@ -163,9 +163,9 @@ When Vault-backed values are used, an IAM policy for the principal that runs the
 
 ### Terraform Bootstrap Module
 
-Use [../token-factory-bootstrap/README.md](Token Factory Bootstrap Module) to provision required infrastructure for Token Factory runtime.
+Use [./bootstrap](Token Factory Bootstrap Module) to provision required infrastructure for Token Factory runtime.
 
-The [../token-factory-bootstrap/client](Bootstrap client wrapper) exposes a concise output surface that application teams can plug into their runtime environments:
+The [./bootstrap/client](Bootstrap client wrapper) exposes a concise output surface that application teams can plug into their runtime environments:
 
 | Output | Use |
 | --- | --- |
@@ -500,7 +500,7 @@ oauth_access_token = result["token"]
 
 ## Related Docs
 
-- [docs/advanced-scenarios.md](./docs/advanced-scenarios.md)
-- [docs/oci-compute-usage.md](./docs/oci-compute-usage.md)
-- [samples/oci_compute_usage.py](./samples/oci_compute_usage.py)
-- [Token Factory Bootstrap Module](../token-factory-bootstrap/README.md)
+- [Token Factory Bootstrap Module](./bootstrap)
+- [Advanced Scenarios](./docs/advanced-scenarios.md)
+- [Compute Usage of Token Factory](./docs/oci-compute-usage.md)
+- [Compute Usage Sample Code](./samples/oci_compute_usage.py)

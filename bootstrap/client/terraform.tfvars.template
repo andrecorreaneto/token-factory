@@ -3,74 +3,56 @@ user_ocid            = "ocid1.user.oc1..replace-with-user-ocid"
 fingerprint          = "19:42:ef:92:...:86:be:02:ba"
 private_key_path     = "replace-with-path-to-private-key-file"
 private_key_password = ""
-region               = "us-chicago-1"
+region               = "replace.with.deployment.region.name"
 
-identity_domain_url    = "https://replace-with-domain.identity.oraclecloud.com:443"
-identity_domain_region = "us-chicago-1"
-resource_name_prefix   = "token-factory"
+identity_domain_url    = "https://replace.with.identity.domain.url:443"
+identity_domain_region = "replace.with.identity.domain.region.name"
 
-enable_oci_secrets                     = true
-oci_secrets_compartment_ocid           = "ocid1.compartment.oc1..replace-with-secrets-compartment-ocid"
-restrict_secret_policy_to_secret_ocids = true
-output_provisioned_resources           = false
-
-# Optional existing Vault/key. Omit both to create shared Vault storage.
-# oci_vault_existing_ocid      = "ocid1.vault.oc1..replace-with-vault"
-# oci_master_key_existing_ocid = "ocid1.key.oc1..replace-with-master-key"
-
-# Optional authorization policy secret.
-# token_factory_authz_policy_secret_ocid = "ocid1.vaultsecret.oc1..replace-with-authz-policy-secret"
-
-# Production signed-envelope policy mode. The signing key is security-owned; this
-# wrapper only passes the trusted public verifier bundle to TokenFactory.
-# token_factory_authz_policy_signature_mode = "on"
-# token_factory_authz_policy_environment    = "prod"
-# emit_authz_policy_tenant_id               = false
-# token_factory_authz_policy_trusted_signers = [
-#   {
-#     key_id         = "ocid1.key.oc1..replace-with-security-owned-kms-key"
-#     key_version_id = "ocid1.keyversion.oc1..replace-with-security-owned-kms-key-version"
-#     algorithm      = "SHA_256_RSA_PKCS_PSS"
-#     public_key_pem = file("${path.module}/security-authz-policy-public-key.pem")
-#   }
-# ]
+oci_secrets_compartment_ocid = "ocid1.compartment.oc1..replace.with.compartment.ocid"
+oci_vault_existing_ocid      = "ocid1.vault.oc1..replace.with.vault.ocid"
+oci_master_key_existing_ocid = "ocid1.key.oc1..replace.with.key.ocid"
+output_provisioned_resources = false
 
 oauth_apps = {
-  MCP_SERVER = {
-    # Optional. Defaults to "mcp-server" from the map key.
-    resource_name_prefix = null
-
-    display_name       = "mcp-server-token-factory-client"
-    description        = "OAuth client and resource-server config for MCP server."
-    issuer             = "https://mcp-server.example.com/token-factory"
-    kid                = "mcp-server-token-factory-cert"
-    resource_audiences = ["mcp-server"]
-    resource_scopes    = ["invoke"]
-    allowed_scopes     = []
-    app_roles          = []
+  PLAYGROUND-MCP-SERVER = {
+    display_name       = "playground-mcp-server"
+    description        = "Playground MCP server application"
+    issuer             = "https://playground.mcp.server/"
+    kid                = "playground-mcp-server-cert"
+    resource_audiences = ["https://playground.mcp.server/"]
+    resource_scopes    = ["tools.get_user_info", "tools.search_employees", "tools.get_oci_resources", "tools.get_stock_quote", "tools.calculator"]
+    app_roles          = ["Me"]
 
     runtime = {
       principal_type   = "compute-instance"
-      compartment_ocid = "ocid1.compartment.oc1..replace-with-runtime-compartment-ocid"
-      resource_ocid    = "ocid1.instance.oc1..replace-with-compute-instance-ocid"
-      oci_auth_profile = null
-      oci_region       = null
+      compartment_ocid = "ocid1.compartment.oc1..replace.with.compartment.ocid"
+      resource_ocid    = null
     }
 
     enable_identity_propagation_trust = true
-    propagation_trust_claim_name      = "upstclient"
-    propagation_trust_claim_value     = "tokenexchange"
 
     jwt_key_material_source = "generate"
+  }
 
-    jwt_private_key_pem                     = null
-    jwt_private_key_passphrase              = null
-    jwt_certificate_pem                     = null
-    jwt_certificate_pem_for_identity_domain = null
+  PLAYGROUND-AGENT = {
+    display_name       = "playground-agent"
+    description        = "Playground agent application"
+    issuer             = "https://playground.agent/"
+    kid                = "playground-agent-cert"
+    resource_audiences = ["https://playground.agent/"]
+    resource_scopes    = ["invoke"]
+    allowed_scopes     = ["https://playground.mcp.server/tools.get_user_info","https://playground.mcp.server/tools.search_employees", "https://playground.mcp.server/tools.get_oci_resources", "https://playground.mcp.server/tools.get_stock_quote", "https://playground.mcp.server/tools.calculator"]
+    app_roles          = ["Me"]
 
-    private_key_secret_existing_ocid            = null
-    private_key_passphrase_secret_existing_ocid = null
-    certificate_secret_existing_ocid            = null
+    runtime = {
+      principal_type   = "compute-instance"
+      compartment_ocid = "ocid1.compartment.oc1..replace.with.compartment.ocid"
+      resource_ocid    = null
+    }
+
+    enable_identity_propagation_trust = false
+
+    jwt_key_material_source = "generate"
   }
 }
 
