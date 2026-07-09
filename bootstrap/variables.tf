@@ -115,7 +115,7 @@ variable "token_factory_groups_claim" {
 }
 
 variable "token_factory_log_full_assertion" {
-  description = "When true, emits TOKEN_FACTORY_LOG_FULL_ASSERTION=true for each hosting runtime config."
+  description = "When true, emits TF_SHARED_LOG_FULL_ASSERTION=true for each hosting runtime config."
   type        = bool
   default     = false
 }
@@ -155,7 +155,7 @@ variable "token_factory_authz_policy_environment" {
 }
 
 variable "emit_authz_policy_tenant_id" {
-  description = "When true, emits TOKEN_FACTORY_AUTHZ_POLICY_TENANT_ID using tenancy_ocid."
+  description = "When true, emits TF_SHARED_AUTHZ_POLICY_TENANT_ID using tenancy_ocid."
   type        = bool
   default     = false
 }

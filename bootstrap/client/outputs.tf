@@ -1,4 +1,4 @@
-output "runtime_config_env" {
+output "runtime_shared_env" {
   description = "Shared shell export lines for TokenFactory runtime configuration."
   value = join("\n", [
     for key, value in module.token_factory_bootstrap.token_factory_shared_runtime_config :
@@ -6,7 +6,7 @@ output "runtime_config_env" {
   ])
 }
 
-output "runtime_config" {
+output "runtime_shared" {
   description = "Shared TokenFactoryRuntimeConfig constructor-shaped runtime config."
   value = {
     for config_key, config_value in {
@@ -25,9 +25,20 @@ output "runtime_config" {
   }
 }
 
-output "oauth_apps" {
+output "runtime_clients_env" {
+  description = "Shell export lines for Token Factory OAuth client configuration by OAuth app key. Contains TF_CLIENT_* values with secret OCID references, not inline secrets."
+  value       = module.token_factory_bootstrap.token_factory_client_config_env
+}
+
+output "runtime_clients" {
   description = "Non-sensitive OAuthClientInfo-shaped resolver config by OAuth app key."
   value       = module.token_factory_bootstrap.oauth_app_configs
+}
+
+output "sensitive_runtime_client_envs" {
+  description = "Sensitive shell export lines for Token Factory OAuth client configuration by OAuth app key, including inline credentials and PEM values when enable_oci_secrets = false."
+  value       = module.token_factory_bootstrap.token_factory_client_sensitive_config_env
+  sensitive   = true
 }
 
 output "provisioned_resources" {

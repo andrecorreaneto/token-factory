@@ -14,7 +14,7 @@ This module manages:
 - Optional OCI Vault, master key, and secrets.
 - Runtime IAM principals: dynamic groups or user groups.
 - IAM policies granting `read secret-bundle` to runtime principals.
-- `TOKEN_FACTORY_*`, OAuth client resolver config, and resource OCID outputs.
+- `TF_SHARED_*`, `TF_CLIENT_*`, OAuth client resolver config, and resource OCID outputs.
 
 ## Mental Model
 
@@ -55,15 +55,15 @@ Adding a new hosting application should be additive: add one `oauth_apps` entry 
 
 | Variable | Type | Default | Runtime output |
 | --- | --- | --- | --- |
-| `token_factory_timeout_seconds` | `number` | `30` | `TOKEN_FACTORY_TIMEOUT_SECONDS` |
-| `token_factory_subject_claim` | `string` | `"sub"` | `TOKEN_FACTORY_SUBJECT_CLAIM` |
-| `token_factory_groups_claim` | `string` | `"group"` | `TOKEN_FACTORY_GROUPS_CLAIM` |
-| `token_factory_log_full_assertion` | `bool` | `false` | `TOKEN_FACTORY_LOG_FULL_ASSERTION`, only when true |
-| `token_factory_authz_policy_secret_ocid` | `string` | `null` | `TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID` |
-| `token_factory_authz_policy_signature_mode` | `string` | `"off"` | `TOKEN_FACTORY_AUTHZ_POLICY_SIGNATURE_MODE` |
-| `token_factory_authz_policy_trusted_signers` | `list(object)` | `[]` | `TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON` |
-| `token_factory_authz_policy_environment` | `string` | `null` | `TOKEN_FACTORY_AUTHZ_POLICY_ENVIRONMENT` |
-| `emit_authz_policy_tenant_id` | `bool` | `false` | `TOKEN_FACTORY_AUTHZ_POLICY_TENANT_ID`, only when true |
+| `token_factory_timeout_seconds` | `number` | `30` | `TF_SHARED_TIMEOUT_SECONDS` |
+| `token_factory_subject_claim` | `string` | `"sub"` | `TF_SHARED_SUBJECT_CLAIM` |
+| `token_factory_groups_claim` | `string` | `"group"` | `TF_SHARED_GROUPS_CLAIM` |
+| `token_factory_log_full_assertion` | `bool` | `false` | `TF_SHARED_LOG_FULL_ASSERTION`, only when true |
+| `token_factory_authz_policy_secret_ocid` | `string` | `null` | `TF_SHARED_AUTHZ_POLICY_SECRET_OCID` |
+| `token_factory_authz_policy_signature_mode` | `string` | `"off"` | `TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE` |
+| `token_factory_authz_policy_trusted_signers` | `list(object)` | `[]` | `TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON` |
+| `token_factory_authz_policy_environment` | `string` | `null` | `TF_SHARED_AUTHZ_POLICY_ENVIRONMENT` |
+| `emit_authz_policy_tenant_id` | `bool` | `false` | `TF_SHARED_AUTHZ_POLICY_TENANT_ID`, only when true |
 
 `token_factory_authz_policy_trusted_signers` entries have this shape:
 
@@ -99,7 +99,7 @@ Map keys are the canonical Token Factory `CallerContext.client_key` values and m
 | `runtime.compartment_ocid` | Yes | Compartment for dynamic group matching or group/policy placement. |
 | `runtime.resource_ocid` | No | Optional exact compute instance, OCI Function, or OKE cluster OCID. |
 | `runtime.oci_auth_profile` | No | Used only when `principal_type = "user-group"`; defaults to `DEFAULT` in runtime config. |
-| `runtime.oci_region` | No | Per-runtime `TOKEN_FACTORY_OCI_REGION`; falls back to `oci_secrets_region` or `identity_domain_region`. |
+| `runtime.oci_region` | No | Per-runtime `TF_SHARED_OCI_REGION`; falls back to `oci_secrets_region` or `identity_domain_region`. |
 | `enable_identity_propagation_trust` | No | Create IdentityPropagationTrust for `oracle-database` and `oci-service` UPST flows. Defaults to true. |
 | `propagation_trust_claim_name` | No | Optional trust client claim name. Must be set with `propagation_trust_claim_value`. |
 | `propagation_trust_claim_value` | No | Optional trust client claim value. Must be set with `propagation_trust_claim_name`. |
@@ -145,7 +145,9 @@ For `MCP_SERVER`, the default per-app prefix is `mcp-server`.
 | --- | --- |
 | `token_factory_shared_runtime_config` | Shared runtime config base. Excludes OAuth app identity fields and per-runtime OCI auth values. |
 | `token_factory_runtime_configs` | Full Token Factory runtime configuration by OAuth app key. |
-| `token_factory_runtime_config_env` | Shell `export` lines for runtime configuration by OAuth app key. |
+| `token_factory_runtime_config_env` | Shell `export` lines for `TF_SHARED_*` runtime configuration by OAuth app key. |
+| `token_factory_client_config_env` | Shell `export` lines for `TF_CLIENT_*` OAuth client configuration by OAuth app key. Contains secret OCID references, not inline secrets. |
+| `token_factory_client_sensitive_config_env` | Sensitive shell `export` lines for `TF_CLIENT_*` OAuth client configuration, including inline credentials and PEM values when `enable_oci_secrets = false`. |
 | `oauth_app_configs` | Non-sensitive `OAuthClientInfo`-shaped resolver config by OAuth app key. Contains secret OCID references, not inline secrets. |
 | `oauth_app_configs_json` | JSON-encoded non-sensitive resolver config for Vault-backed deployments. |
 | `oauth_app_sensitive_configs` | Sensitive resolver config including inline credentials and PEM values when `enable_oci_secrets = false`. |
@@ -179,9 +181,9 @@ oci_vault_existing_ocid = var.vault_ocid
 
 Providing `oci_master_key_existing_ocid` without `oci_vault_existing_ocid` is invalid.
 
-Vault-backed deployments should use `oauth_app_configs_json`. The output contains resolver config with secret OCID references.
+Vault-backed deployments should use `oauth_app_configs_json` for constructor-based configuration or `token_factory_client_config_env` for environment-based configuration. Both outputs contain resolver config with secret OCID references.
 
-Direct-value deployments set `enable_oci_secrets = false` and use `oauth_app_sensitive_configs_json`. Terraform redacts that output by default.
+Direct-value deployments set `enable_oci_secrets = false` and use `oauth_app_sensitive_configs_json` or `token_factory_client_sensitive_config_env`. Terraform redacts those outputs by default.
 
 ## Key Material Sources
 
@@ -199,7 +201,7 @@ When `enable_oci_secrets = false`, OCI secrets, runtime IAM groups, and runtime 
 
 Runtime IAM is configured per OAuth app with `oauth_apps[*].runtime.principal_type`.
 
-| `runtime.principal_type` | `TOKEN_FACTORY_OCI_AUTH_MODE` | Principal created |
+| `runtime.principal_type` | `TF_SHARED_OCI_AUTH_MODE` | Principal created |
 | --- | --- | --- |
 | `compute-instance` | `instance-principal` | Dynamic group |
 | `oci-function` | `resource-principal` | Dynamic group |

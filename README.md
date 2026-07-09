@@ -118,7 +118,7 @@ result = factory.get_token_with_oci_credential(
 
 ## How TokenFactory Works
 
-TokenFactory is essentially a helper library that hides the complexity of token exchange on behalf of its importing clients. As such, before requesting a token, it validates the requesting credential. When `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=true`, it also checks whether the subject in the credential is entitled to request the scope for `oauth` and `oracle-database` flows.
+TokenFactory is essentially a helper library that hides the complexity of token exchange on behalf of its importing clients. As such, before requesting a token, it validates the requesting credential. When `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, it also checks whether the subject in the credential is entitled to request the scope for `oauth` and `oracle-database` flows.
 
 ### Credential Validation
 
@@ -133,8 +133,8 @@ TokenFactory is essentially a helper library that hides the complexity of token 
 
 ### Token Request Authorization
 
-1. Authorization policy enforcement is opt-in. When `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=false` or unset, TokenFactory skips group-scope authorization checks for scoped flows.
-2. When `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=true`, scoped flows such as `oauth` and `oracle-database` check the authorization policy to determine whether the requesting credential is entitled to request the scope.
+1. Authorization policy enforcement is opt-in. When `TF_SHARED_AUTHZ_POLICY_ENABLE=false` or unset, TokenFactory skips group-scope authorization checks for scoped flows.
+2. When `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, scoped flows such as `oauth` and `oracle-database` check the authorization policy to determine whether the requesting credential is entitled to request the scope.
 3. When enforcement is enabled, at least one caller group must be allowed to request every downstream scope. If no policy provider is configured or the policy does not grant the scope, TokenFactory fails closed.
 4. For `oauth`, authorization policy entries must match the requested scope exactly. If the request uses a fully qualified resource scope such as `https://orders-api.example.com/orders.read`, the policy must grant that fully qualified value.
 5. Unscoped flows such as `userid` and `oci-service` do not run group-scope authorization.
@@ -163,9 +163,9 @@ When Vault-backed values are used, an IAM policy for the principal that runs the
 
 ### Terraform Bootstrap Module
 
-Use [./bootstrap](Token Factory Bootstrap Module) to provision required infrastructure for Token Factory runtime.
+Use [../token-factory-bootstrap/README.md](Token Factory Bootstrap Module) to provision required infrastructure for Token Factory runtime.
 
-The [./bootstrap/client](Bootstrap client wrapper) exposes a concise output surface that application teams can plug into their runtime environments:
+The [../token-factory-bootstrap/client](Bootstrap client wrapper) exposes a concise output surface that application teams can plug into their runtime environments:
 
 | Output | Use |
 | --- | --- |
@@ -180,7 +180,7 @@ The following pre-requisites are fulfilled by the bootstrap module. They are pre
 
 **1. Confidential OAuth app client for each hosting app**
 
-Create one confidential app client in the same Identity Domain used by `TOKEN_FACTORY_DOMAIN_URL` for each hosting application that embeds TokenFactory.
+Create one confidential app client in the same Identity Domain used by `TF_SHARED_DOMAIN_URL` for each hosting application that embeds TokenFactory.
 
 TokenFactory itself is not the OAuth client. The selected hosting app OAuth client is used for token introspection, JWT bearer exchange, and UPST-backed exchange. This material comes from the selected `oauth_apps[client_key]` entry or from an explicitly supplied resolver.
 
@@ -213,7 +213,7 @@ The trust must be aligned with the module configuration:
 The common propagation-claim pattern is:
 
 ```text
-TOKEN_FACTORY_PROPAGATION_TRUST_CLAIM="upstclient:tokenexchange"
+TF_CLIENT_PROPAGATION_TRUST_CLAIM="upstclient:tokenexchange"
 ```
 
 That maps cleanly to an IdentityPropagationTrust using:
@@ -281,13 +281,13 @@ Expected secret contents when Vault-backed sources are used through `oauth_apps`
 - `private_key_secret_ocid`: PEM-encoded RSA private key
 - `private_key_passphrase_secret_ocid`: plain text private-key passphrase
 - `certificate_secret_ocid`: PEM-encoded X.509 certificate
-- `TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID`: raw policy JSON or signed policy envelope JSON
+- `TF_SHARED_AUTHZ_POLICY_SECRET_OCID`: raw policy JSON or signed policy envelope JSON
 
 Notes:
 
 - Secret bundle content is base64-decoded and then treated as UTF-8 text, so PEM text is the safest format for key and certificate secrets.
-- If `TOKEN_FACTORY_OCI_REGION` is not set, the secret's region is derived from the OCID.
-- If any secret OCID source is configured, the runtime principal must be able to read every referenced secret. Use a dynamic group for instance-principal and resource-principal runtimes, or a user group for `TOKEN_FACTORY_OCI_AUTH_MODE=oci-profile`.
+- If `TF_SHARED_OCI_REGION` is not set, the secret's region is derived from the OCID.
+- If any secret OCID source is configured, the runtime principal must be able to read every referenced secret. Use a dynamic group for instance-principal and resource-principal runtimes, or a user group for `TF_SHARED_OCI_AUTH_MODE=oci-profile`.
 - Example dynamic-group matching rules:
 
   ```text
@@ -313,13 +313,13 @@ Notes:
   # Resource-principal authentication, assuming the principal is an OKE cluster.
   allow dynamic-group <oke-cluster-dynamic-group> to read secret-bundles in compartment <secrets-compartment-name>
 
-  # API-key authentication through TOKEN_FACTORY_OCI_AUTH_MODE=oci-profile.
+  # API-key authentication through TF_SHARED_OCI_AUTH_MODE=oci-profile.
   allow group <user-group> to read secret-bundles in compartment <secrets-compartment-name>
   ```
 
   Add `where target.secret.id = '<secret-ocid>'` to restrict a policy to a specific configured secret.
 
-- Factory-owned OCI SDK clients use Instance Principals by default. `TOKEN_FACTORY_OCI_AUTH_MODE=resource-principal` uses Resource Principals directly, and `TOKEN_FACTORY_OCI_AUTH_MODE=oci-profile` enables local OCI API-key profile fallback.
+- Factory-owned OCI SDK clients use Instance Principals by default. `TF_SHARED_OCI_AUTH_MODE=resource-principal` uses Resource Principals directly, and `TF_SHARED_OCI_AUTH_MODE=oci-profile` enables local OCI API-key profile fallback.
 - Vault reads are skipped for any material supplied directly through `OAuthClientInfo`, such as `client_credentials`, `private_key_path`, `private_key_pem`, `certificate_path`, or `certificate_pem`.
 
 
@@ -329,29 +329,29 @@ These variables populate `TokenFactoryRuntimeConfig` or process-level TokenFacto
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `TOKEN_FACTORY_DOMAIN_URL` | yes | Identity Domain base URL, for example `https://<domain>.identity.oraclecloud.com:443`. Trailing slash is removed. |
-| `TOKEN_FACTORY_DOMAIN_REGION` | yes | OCI region used for UPST `TokenExchangeSigner` and Identity Data Plane calls. |
-| `TOKEN_FACTORY_TIMEOUT_SECONDS` | optional | HTTP timeout in seconds; default `30`. |
-| `TOKEN_FACTORY_OCI_AUTH_MODE` | optional | OCI auth mode for factory-owned OCI SDK clients: `instance-principal` (default), `resource-principal`, or `oci-profile`. Required in practice when Vault OCIDs must be read. |
-| `TOKEN_FACTORY_OCI_AUTH_PROFILE` | optional | OCI CLI profile used when `TOKEN_FACTORY_OCI_AUTH_MODE=oci-profile`; defaults to `DEFAULT`. |
-| `TOKEN_FACTORY_OCI_REGION` | optional | Region override for OCI Vault secret reads. If unset, secret region is derived from the secret OCID when possible. |
-| `TOKEN_FACTORY_SUBJECT_CLAIM` | optional | Claim name used to extract the validated caller subject; defaults to `sub`. |
-| `TOKEN_FACTORY_GROUPS_CLAIM` | optional | Claim name used to extract caller groups for authorization; defaults to `groups`. |
-| `TOKEN_FACTORY_LOG_FULL_ASSERTION` | optional | Enables full compact JWT logging. Use only for controlled troubleshooting because assertions are replay-sensitive. |
-| `TOKEN_FACTORY_LOG_LEVEL` | optional | Module logger level; defaults to `INFO`. Accepted values are `CRITICAL`, `FATAL`, `ERROR`, `WARNING`, `WARN`, `INFO`, `DEBUG`, and `NOTSET`. |
+| `TF_SHARED_DOMAIN_URL` | yes | Identity Domain base URL, for example `https://<domain>.identity.oraclecloud.com:443`. Trailing slash is removed. |
+| `TF_SHARED_DOMAIN_REGION` | yes | OCI region used for UPST `TokenExchangeSigner` and Identity Data Plane calls. |
+| `TF_SHARED_TIMEOUT_SECONDS` | optional | HTTP timeout in seconds; default `30`. |
+| `TF_SHARED_OCI_AUTH_MODE` | optional | OCI auth mode for factory-owned OCI SDK clients: `instance-principal` (default), `resource-principal`, or `oci-profile`. Required in practice when Vault OCIDs must be read. |
+| `TF_SHARED_OCI_AUTH_PROFILE` | optional | OCI CLI profile used when `TF_SHARED_OCI_AUTH_MODE=oci-profile`; defaults to `DEFAULT`. |
+| `TF_SHARED_OCI_REGION` | optional | Region override for OCI Vault secret reads. If unset, secret region is derived from the secret OCID when possible. |
+| `TF_SHARED_SUBJECT_CLAIM` | optional | Claim name used to extract the validated caller subject; defaults to `sub`. |
+| `TF_SHARED_GROUPS_CLAIM` | optional | Claim name used to extract caller groups for authorization; defaults to `groups`. |
+| `TF_SHARED_LOG_FULL_ASSERTION` | optional | Enables full compact JWT logging. Use only for controlled troubleshooting because assertions are replay-sensitive. |
+| `TF_SHARED_LOG_LEVEL` | optional | Module logger level; defaults to `INFO`. Accepted values are `CRITICAL`, `FATAL`, `ERROR`, `WARNING`, `WARN`, `INFO`, `DEBUG`, and `NOTSET`. |
 
 ### Authorization policy environment variables
 
-Authorization policy enforcement is disabled by default. When `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=false` or unset, TokenFactory does not run group-scope authorization checks for scoped token requests. When `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=true`, scoped assertion-backed flows (`oauth` and `oracle-database`) require a configured policy provider and are denied after caller assertion validation if no policy is configured or no grant matches.
+Authorization policy enforcement is disabled by default. When `TF_SHARED_AUTHZ_POLICY_ENABLE=false` or unset, TokenFactory does not run group-scope authorization checks for scoped token requests. When `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, scoped assertion-backed flows (`oauth` and `oracle-database`) require a configured policy provider and are denied after caller assertion validation if no policy is configured or no grant matches.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE` | optional | Enables TokenFactory group-scope authorization when set to `1`, `true`, `yes`, `y`, or `on`; defaults to `false`. |
-| `TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID` | required when enforcement uses the built-in Vault policy provider | OCI Vault secret OCID containing raw authorization policy JSON in `off` mode or a signed authorization policy envelope in `on` mode. This configures one policy-provider path; it is not the enforcement switch. |
-| `TOKEN_FACTORY_AUTHZ_POLICY_SIGNATURE_MODE` | optional | `off` or `on`; defaults to `off`. Production deployments with the security-owned matrix should use `on`. |
-| `TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON` | required when signature mode is `on` | JSON array of trusted signer entries with `key_id`, `key_version_id`, `algorithm`, and `public_key_pem`. |
-| `TOKEN_FACTORY_AUTHZ_POLICY_ENVIRONMENT` | optional | Expected signed-policy `metadata.environment`, such as `prod`. If set, mismatches fail closed. |
-| `TOKEN_FACTORY_AUTHZ_POLICY_TENANT_ID` | optional | Expected signed-policy `metadata.tenant_id`. Bootstrap emits this only when `emit_authz_policy_tenant_id = true`. |
+| `TF_SHARED_AUTHZ_POLICY_ENABLE` | optional | Enables TokenFactory group-scope authorization when set to `1`, `true`, `yes`, `y`, or `on`; defaults to `false`. |
+| `TF_SHARED_AUTHZ_POLICY_SECRET_OCID` | required when enforcement uses the built-in Vault policy provider | OCI Vault secret OCID containing raw authorization policy JSON in `off` mode or a signed authorization policy envelope in `on` mode. This configures one policy-provider path; it is not the enforcement switch. |
+| `TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE` | optional | `off` or `on`; defaults to `off`. Production deployments with the security-owned matrix should use `on`. |
+| `TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON` | required when signature mode is `on` | JSON array of trusted signer entries with `key_id`, `key_version_id`, `algorithm`, and `public_key_pem`. |
+| `TF_SHARED_AUTHZ_POLICY_ENVIRONMENT` | optional | Expected signed-policy `metadata.environment`, such as `prod`. If set, mismatches fail closed. |
+| `TF_SHARED_AUTHZ_POLICY_TENANT_ID` | optional | Expected signed-policy `metadata.tenant_id`. Bootstrap emits this only when `emit_authz_policy_tenant_id = true`. |
 
 Trusted signer entry shape:
 
@@ -388,7 +388,7 @@ Every assertion-backed `get_token(...)` call resolves the hosting OAuth app from
 Important behavior details:
 
 - `get_token()` validates incoming caller assertions before trusting subject, groups, audience, or incoming scopes.
-- `get_token()` authorizes scoped downstream flows only when `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=true`. In current code, scoped flows are `oauth` and `oracle-database`.
+- `get_token()` authorizes scoped downstream flows only when `TF_SHARED_AUTHZ_POLICY_ENABLE=true`. In current code, scoped flows are `oauth` and `oracle-database`.
 - For `oauth`, `scope` is the Identity Domain token request scope. Use the fully qualified resource scope when the Identity Domain requires it, for example `https://playground.mcp.server/tools.get_user_info`. TokenFactory authorizes the exact requested scope, so policy documents must grant that fully qualified value.
 - For `oauth`, TokenFactory can pass through the incoming token instead of minting a new one only when the validated incoming token already has the requested resource audience and the issued scope.
 - `userid` validates the incoming assertion and extracts the configured subject claim, but does not run group/scope authorization.
@@ -396,7 +396,7 @@ Important behavior details:
 - `get_token_with_oci_credential()` is a separate OAuth token-exchange API for OCI signer dictionaries or OCI CLI profile names. Current code does not validate an end-user assertion and does not run group/scope authorization for that API.
 - Vault-backed OAuth app values require the hosting runtime principal to read the referenced secrets.
 - Direct creds, local key files, and inline PEM/cert values avoid Vault reads for those materials.
-- `TOKEN_FACTORY_OCI_AUTH_MODE` and `TOKEN_FACTORY_OCI_AUTH_PROFILE` apply to factory-owned OCI clients generally, including Vault secret reads.
+- `TF_SHARED_OCI_AUTH_MODE` and `TF_SHARED_OCI_AUTH_PROFILE` apply to factory-owned OCI clients generally, including Vault secret reads.
 
 Hybrid validation notes:
 
@@ -417,22 +417,22 @@ Signed authorization policy notes:
 
 Logging notes:
 
-- `TOKEN_FACTORY_LOG_LEVEL=DEBUG` enables the module's debug records, including `_factory_support.py` method-entry logs emitted through `LOGGER.debug(...)`.
+- `TF_SHARED_LOG_LEVEL=DEBUG` enables the module's debug records, including `_factory_support.py` method-entry logs emitted through `LOGGER.debug(...)`.
 - `FATAL` is accepted as an alias for `CRITICAL`; `WARN` is accepted as an alias for `WARNING`.
 - `NOTSET` is a valid Python logging level, but it makes the `token_factory` logger inherit the effective level from parent/root logging configuration. Use `DEBUG` when you explicitly need debug output.
-- The module sets the `token_factory` logger level directly so `TOKEN_FACTORY_LOG_LEVEL` still takes effect when another framework has already configured root logging. Existing handler-level filters, OCI Function/runtime log filters, or external log collectors can still suppress records after the logger emits them.
+- The module sets the `token_factory` logger level directly so `TF_SHARED_LOG_LEVEL` still takes effect when another framework has already configured root logging. Existing handler-level filters, OCI Function/runtime log filters, or external log collectors can still suppress records after the logger emits them.
 
 
 ## Runtime Example
 
 1. Set the following process variables for the hosting application. These values are provided by the bootstrap module.
 ```sh
-export TOKEN_FACTORY_DOMAIN_URL="https://<domain>.identity.oraclecloud.com:443"
-export TOKEN_FACTORY_DOMAIN_REGION="us-chicago-1"
-export TOKEN_FACTORY_AUTHZ_POLICY_ENABLE="true"
-export TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID="ocid1.vaultsecret.oc1..<authz-policy>"
-export TOKEN_FACTORY_AUTHZ_POLICY_SIGNATURE_MODE="off"
-export TOKEN_FACTORY_TIMEOUT_SECONDS="30"
+export TF_SHARED_DOMAIN_URL="https://<domain>.identity.oraclecloud.com:443"
+export TF_SHARED_DOMAIN_REGION="us-chicago-1"
+export TF_SHARED_AUTHZ_POLICY_ENABLE="true"
+export TF_SHARED_AUTHZ_POLICY_SECRET_OCID="ocid1.vaultsecret.oc1..<authz-policy>"
+export TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE="off"
+export TF_SHARED_TIMEOUT_SECONDS="30"
 ```
 
 2. Let Token Factory know about the hosting application. These values are provided by the bootstrap module.
@@ -500,7 +500,7 @@ oauth_access_token = result["token"]
 
 ## Related Docs
 
-- [Token Factory Bootstrap Module](./bootstrap)
-- [Advanced Scenarios](./docs/advanced-scenarios.md)
-- [Compute Usage of Token Factory](./docs/oci-compute-usage.md)
-- [Compute Usage Sample Code](./samples/oci_compute_usage.py)
+- [docs/advanced-scenarios.md](./docs/advanced-scenarios.md)
+- [docs/oci-compute-usage.md](./docs/oci-compute-usage.md)
+- [samples/oci_compute_usage.py](./samples/oci_compute_usage.py)
+- [Token Factory Bootstrap Module](../token-factory-bootstrap/README.md)

@@ -252,17 +252,17 @@ locals {
 
   token_factory_shared_runtime_config = {
     for key, value in {
-      TOKEN_FACTORY_DOMAIN_URL                  = var.identity_domain_url
-      TOKEN_FACTORY_DOMAIN_REGION               = var.identity_domain_region
-      TOKEN_FACTORY_TIMEOUT_SECONDS             = var.token_factory_timeout_seconds
-      TOKEN_FACTORY_SUBJECT_CLAIM               = var.token_factory_subject_claim
-      TOKEN_FACTORY_GROUPS_CLAIM                = var.token_factory_groups_claim
-      TOKEN_FACTORY_LOG_FULL_ASSERTION          = var.token_factory_log_full_assertion ? "true" : null
-      TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID    = var.token_factory_authz_policy_secret_ocid
-      TOKEN_FACTORY_AUTHZ_POLICY_SIGNATURE_MODE = var.token_factory_authz_policy_signature_mode
-      TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON  = length(var.token_factory_authz_policy_trusted_signers) == 0 ? null : jsonencode(var.token_factory_authz_policy_trusted_signers)
-      TOKEN_FACTORY_AUTHZ_POLICY_ENVIRONMENT    = var.token_factory_authz_policy_environment
-      TOKEN_FACTORY_AUTHZ_POLICY_TENANT_ID      = var.emit_authz_policy_tenant_id ? var.tenancy_ocid : null
+      TF_SHARED_DOMAIN_URL                  = var.identity_domain_url
+      TF_SHARED_DOMAIN_REGION               = var.identity_domain_region
+      TF_SHARED_TIMEOUT_SECONDS             = var.token_factory_timeout_seconds
+      TF_SHARED_SUBJECT_CLAIM               = var.token_factory_subject_claim
+      TF_SHARED_GROUPS_CLAIM                = var.token_factory_groups_claim
+      TF_SHARED_LOG_FULL_ASSERTION          = var.token_factory_log_full_assertion ? "true" : null
+      TF_SHARED_AUTHZ_POLICY_SECRET_OCID    = var.token_factory_authz_policy_secret_ocid
+      TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE = var.token_factory_authz_policy_signature_mode
+      TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON  = length(var.token_factory_authz_policy_trusted_signers) == 0 ? null : jsonencode(var.token_factory_authz_policy_trusted_signers)
+      TF_SHARED_AUTHZ_POLICY_ENVIRONMENT    = var.token_factory_authz_policy_environment
+      TF_SHARED_AUTHZ_POLICY_TENANT_ID      = var.emit_authz_policy_tenant_id ? var.tenancy_ocid : null
     } : key => value if value != null
   }
 
@@ -281,10 +281,9 @@ locals {
       local.token_factory_shared_runtime_config,
       {
         for runtime_key, runtime_value in {
-          TOKEN_FACTORY_OCI_AUTH_MODE           = local.runtime_oci_auth_modes[key]
-          TOKEN_FACTORY_OCI_AUTH_PROFILE        = component.runtime.principal_type == "user-group" ? coalesce(component.runtime.oci_auth_profile, "DEFAULT") : null
-          TOKEN_FACTORY_OCI_REGION              = coalesce(component.runtime.oci_region, var.oci_secrets_region, var.identity_domain_region)
-          TOKEN_FACTORY_PROPAGATION_TRUST_CLAIM = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
+          TF_SHARED_OCI_AUTH_MODE    = local.runtime_oci_auth_modes[key]
+          TF_SHARED_OCI_AUTH_PROFILE = component.runtime.principal_type == "user-group" ? coalesce(component.runtime.oci_auth_profile, "DEFAULT") : null
+          TF_SHARED_OCI_REGION       = coalesce(component.runtime.oci_region, var.oci_secrets_region, var.identity_domain_region)
         } : runtime_key => runtime_value if runtime_value != null
       }
     )
@@ -304,6 +303,7 @@ locals {
         kid                                = component.kid
         resource_audiences                 = component.resource_audiences
         required_incoming_scopes           = component.resource_scopes
+        propagation_trust_claim            = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
       } : config_key => config_value if config_value != null
     }
   }
@@ -318,6 +318,39 @@ locals {
           private_key_pem        = var.enable_oci_secrets ? null : local.jwt_private_key_pem_values[key]
           private_key_passphrase = var.enable_oci_secrets ? null : component.jwt_private_key_passphrase
           certificate_pem        = var.enable_oci_secrets ? null : local.jwt_certificate_pem_values[key]
+        } : config_key => config_value if config_value != null
+      }
+    )
+  }
+
+  token_factory_client_configs = {
+    for key, component in var.oauth_apps :
+    key => {
+      for config_key, config_value in {
+        TF_CLIENT_KEY                                = key
+        TF_CLIENT_CREDS_SECRET_OCID                  = local.client_credentials_secret_ocids[key]
+        TF_CLIENT_ISSUER                             = component.issuer
+        TF_CLIENT_PRIVATE_KEY_SECRET_OCID            = local.private_key_secret_ocids[key]
+        TF_CLIENT_PRIVATE_KEY_PASSPHRASE_SECRET_OCID = local.private_key_passphrase_secret_ocids[key]
+        TF_CLIENT_CERT_SECRET_OCID                   = local.certificate_secret_ocids[key]
+        TF_CLIENT_KID                                = component.kid
+        TF_CLIENT_RESOURCE_AUDIENCES                 = join(",", component.resource_audiences)
+        TF_CLIENT_REQUIRED_INCOMING_SCOPES           = length(component.resource_scopes) == 0 ? null : join(",", component.resource_scopes)
+        TF_CLIENT_PROPAGATION_TRUST_CLAIM            = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
+      } : config_key => config_value if config_value != null
+    }
+  }
+
+  token_factory_client_sensitive_configs = {
+    for key, component in var.oauth_apps :
+    key => merge(
+      local.token_factory_client_configs[key],
+      {
+        for config_key, config_value in {
+          TF_CLIENT_CREDS                  = var.enable_oci_secrets ? null : local.client_credentials[key]
+          TF_CLIENT_PRIVATE_KEY_PEM        = var.enable_oci_secrets ? null : local.jwt_private_key_pem_values[key]
+          TF_CLIENT_PRIVATE_KEY_PASSPHRASE = var.enable_oci_secrets ? null : component.jwt_private_key_passphrase
+          TF_CLIENT_CERT_PEM               = var.enable_oci_secrets ? null : local.jwt_certificate_pem_values[key]
         } : config_key => config_value if config_value != null
       }
     )

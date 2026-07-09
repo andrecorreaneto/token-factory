@@ -19,6 +19,28 @@ output "token_factory_runtime_config_env" {
   }
 }
 
+output "token_factory_client_config_env" {
+  description = "Shell export lines for Token Factory OAuth client configuration by OAuth app key. Contains TF_CLIENT_* values with secret OCID references, not inline secrets."
+  value = {
+    for component_key, config in local.token_factory_client_configs :
+    component_key => join("\n", [
+      for key, value in config :
+      "export ${key}=${jsonencode(tostring(value))}"
+    ])
+  }
+}
+
+output "token_factory_client_sensitive_config_env" {
+  description = "Sensitive shell export lines for Token Factory OAuth client configuration by OAuth app key, including inline credentials and PEM values when enable_oci_secrets = false."
+  value = {
+    for component_key, config in local.token_factory_client_sensitive_configs :
+    component_key => join("\n", [
+      for key, value in config :
+      "export ${key}=${jsonencode(tostring(value))}"
+    ])
+  }
+  sensitive = true
+}
 output "oauth_app_configs" {
   description = "Token Factory OAuthClientInfo-shaped resolver config by OAuth app key. Regular output contains only non-secret values and secret OCID references."
   value       = local.oauth_app_configs

@@ -24,6 +24,7 @@ class OAuthClientInfo:
     certificate_path: Optional[str] = None
     certificate_secret_ocid: Optional[str] = None
     kid: Optional[str] = None
+    propagation_trust_claim: Optional[str] = None
     resource_audiences: List[str] = field(default_factory=list)
     required_incoming_scopes: List[str] = field(default_factory=list)
 
@@ -44,6 +45,7 @@ class ResolvedHostingComponent:
     client_key: str
     oauth_identity: OAuthClientIdentity
     resource_audiences: List[str]
+    propagation_trust_claim: Optional[str] = None
     required_incoming_scopes: List[str] = field(default_factory=list)
 
 
@@ -80,6 +82,7 @@ class StaticOAuthClientResolver(OAuthClientResolver):
                     certificate_pem=certificate_pem,
                     certificate_secret_ocid=config.assertion_cert_secret_ocid,
                     kid=config.assertion_kid,
+                    propagation_trust_claim=config.propagation_trust_claim,
                     resource_audiences=["default"],
                 )
             }
@@ -154,6 +157,7 @@ class StaticOAuthClientResolver(OAuthClientResolver):
                 private_key_passphrase=private_key_passphrase,
             ),
             resource_audiences=list(info.resource_audiences),
+            propagation_trust_claim=info.propagation_trust_claim,
             required_incoming_scopes=list(info.required_incoming_scopes),
         )
 

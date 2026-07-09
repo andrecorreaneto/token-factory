@@ -236,7 +236,7 @@ class TokenFactory:
             "exp": now + 300,
             "jti": str(uuid.uuid4()),
         }
-        payload.update(_propagation_trust_claim(self._runtime_config, token_type))
+        payload.update(_propagation_trust_claim(hosting_component, token_type))
         headers = {"typ": "JWT"}
         if identity.kid:
             headers["kid"] = identity.kid
@@ -577,17 +577,17 @@ def _jwt_audience(runtime_config: TokenFactoryRuntimeConfig, token_type: str) ->
 
 
 def _propagation_trust_claim(
-    runtime_config: TokenFactoryRuntimeConfig,
+    hosting_component: ResolvedHostingComponent,
     token_type: str,
 ) -> Dict[str, str]:
     if token_type not in {"oracle-database", "oci-service"}:
         return {}
-    if not runtime_config.propagation_trust_claim:
+    if not hosting_component.propagation_trust_claim:
         return {}
-    claim_name, separator, claim_value = runtime_config.propagation_trust_claim.partition(":")
+    claim_name, separator, claim_value = hosting_component.propagation_trust_claim.partition(":")
     if separator != ":" or not claim_name.strip() or not claim_value.strip():
         raise ConfigurationError(
-            "TOKEN_FACTORY_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value"
+            "TF_CLIENT_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value"
         )
     return {claim_name.strip(): claim_value.strip()}
 
