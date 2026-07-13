@@ -118,6 +118,15 @@ class TokenFactory:
             raise ValueError(
                 f"Unsupported token_type '{token_type}'. Supported values: {supported}"
             )
+        resolved_client_key = _require_client_key(client_key)
+        if token_type == "oauth" and credential is None:
+            if not scope:
+                raise ValueError(f"Scope is required for token_type '{token_type}'")
+            hosting_component = self._resolve_hosting_component(resolved_client_key)
+            return self._exchange_client_credentials_for_oauth(
+                scope,
+                hosting_component,
+            )
         if not isinstance(credential, str) or not credential:
             raise ValueError(
                 f"token_type '{token_type}' requires credential to be a non-empty caller assertion string."
@@ -125,7 +134,6 @@ class TokenFactory:
         if token_type in {"oauth", "oracle-database"} and not scope:
             raise ValueError(f"Scope is required for token_type '{token_type}'")
 
-        resolved_client_key = _require_client_key(client_key)
         context = self._validate_assertion(credential, resolved_client_key)
         if token_type == "userid":
             return {"issued_token_type": "userid", "user_id": context["subject"]}
@@ -189,11 +197,7 @@ class TokenFactory:
         credential: str,
         client_key: str,
     ) -> Dict[str, Any]:
-        if self._oauth_client_resolver is None:
-            raise OAuthClientResolutionError(
-                "TokenFactory.get_token requires oauth_apps or oauth_client_resolver."
-            )
-        hosting_component = self._oauth_client_resolver.resolve(client_key)
+        hosting_component = self._resolve_hosting_component(client_key)
         validated = self._token_validator.validate(credential, hosting_component)
         subject = validated.claims.get(self._runtime_config.subject_claim)
         if not subject:
@@ -207,6 +211,13 @@ class TokenFactory:
             "subject": str(subject),
             "groups": groups,
         }
+
+    def _resolve_hosting_component(self, client_key: str) -> ResolvedHostingComponent:
+        if self._oauth_client_resolver is None:
+            raise OAuthClientResolutionError(
+                "TokenFactory.get_token requires oauth_apps or oauth_client_resolver."
+            )
+        return self._oauth_client_resolver.resolve(client_key)
 
     def _authorize(self, context: Dict[str, Any], token_type: str, scope: str) -> None:
         if not self._authz_policy_enable:
@@ -271,6 +282,34 @@ class TokenFactory:
             timeout=self._runtime_config.timeout_seconds,
         )
         return _oauth_result(_response_payload_or_raise(response, "OAuth exchange"))
+
+    def _exchange_client_credentials_for_oauth(
+        self,
+        scope: Optional[str],
+        hosting_component: ResolvedHostingComponent,
+    ) -> Dict[str, Any]:
+        identity = hosting_component.oauth_identity
+        credentials = base64.b64encode(
+            f"{identity.client_id}:{identity.client_secret}".encode("utf-8")
+        ).decode("utf-8")
+        request_data = {
+            "grant_type": "client_credentials",
+        }
+        if scope:
+            request_data["scope"] = scope
+
+        response = self._token_endpoint_session.post(
+            f"{self._runtime_config.domain_url}/oauth2/v1/token",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Basic {credentials}",
+            },
+            data=request_data,
+            timeout=self._runtime_config.timeout_seconds,
+        )
+        return _oauth_result(
+            _response_payload_or_raise(response, "OAuth client credentials exchange")
+        )
 
     def _exchange_oci_service_token(
         self,
