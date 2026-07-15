@@ -407,10 +407,10 @@ Every `get_token(...)` call resolves the hosting OAuth app from the `oauth_apps`
 | --- | --- | --- |
 | `client_credentials` | yes, unless `client_credentials_secret_ocid` is set | Direct `client_id:client_secret`. |
 | `client_credentials_secret_ocid` | yes, unless `client_credentials` is set | Vault secret containing `client_id:client_secret`. |
-| `issuer` | yes | JWT `iss` used when signing assertions for this hosting app. |
-| `private_key_pem` | one key source required by the current resolver | Direct private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not used for private-key crypto in OAuth client credentials mode. |
-| `private_key_path` | one key source required by the current resolver | Local private key path. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not used for private-key crypto in OAuth client credentials mode. |
-| `private_key_secret_ocid` | one key source required by the current resolver | Vault secret containing private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not used for private-key crypto in OAuth client credentials mode. |
+| `issuer` | yes for assertion-backed flows | JWT `iss` used when signing assertions for this hosting app. |
+| `private_key_pem` | one key source required for assertion-backed flows | Direct private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
+| `private_key_path` | one key source required for assertion-backed flows | Local private key path. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
+| `private_key_secret_ocid` | one key source required for assertion-backed flows | Vault secret containing private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
 | `private_key_passphrase` | optional | Direct private-key passphrase. |
 | `private_key_passphrase_secret_ocid` | optional | Vault secret containing the passphrase. |
 | `certificate_pem` | optional in resolver, required by Identity Domain setup | Direct certificate PEM matching the private key. |

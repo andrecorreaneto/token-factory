@@ -5,6 +5,7 @@ import jwt
 import requests
 
 from ._errors import CallerAssertionValidationError
+from ._normalization import normalize_audience, normalize_scopes, normalize_unique_strings
 from ._oauth_client_resolution import ResolvedHostingComponent
 
 
@@ -17,21 +18,12 @@ class ValidatedCallerAssertion:
 
 
 class TokenValidator:
-    def __init__(
-        self,
-        domain_url: str,
-        timeout_seconds: int = 30,
-        session: Any = requests,
-    ):
+    def __init__(self, domain_url: str, timeout_seconds: int = 30, session: Any = requests):
         self._domain_url = domain_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._session = session
 
-    def validate(
-        self,
-        token: str,
-        hosting_component: ResolvedHostingComponent,
-    ) -> ValidatedCallerAssertion:
+    def validate(self, token: str, hosting_component: ResolvedHostingComponent) -> ValidatedCallerAssertion:
         endpoint = f"{self._domain_url}/oauth2/v1/introspect"
         try:
             response = self._session.post(
@@ -60,45 +52,11 @@ class TokenValidator:
         return _validated_from_claims(payload, hosting_component)
 
 
-class TrustedTokenValidator:
-    def validate(
-        self,
-        token: str | Dict[str, Any],
-        hosting_component: ResolvedHostingComponent,
-    ) -> ValidatedCallerAssertion:
-        if isinstance(token, dict):
-            claims = token
-        else:
-            try:
-                claims = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
-            except Exception as exc:
-                raise CallerAssertionValidationError(f"Trusted token cannot be decoded: {exc}") from exc
-        return _validated_from_claims(claims, hosting_component)
-
-
-class LocalTokenValidator(TrustedTokenValidator):
-    def __init__(self, claims: Optional[Dict[str, Any]] = None):
-        self._claims = claims
-
-    def validate(
-        self,
-        token: str | Dict[str, Any],
-        hosting_component: ResolvedHostingComponent,
-    ) -> ValidatedCallerAssertion:
-        if self._claims is not None:
-            return _validated_from_claims(dict(self._claims), hosting_component)
-        return super().validate(token, hosting_component)
-
-
 class JwtTokenValidator:
     def __init__(self, trusted_issuers: Dict[str, Dict[str, Any]]):
         self._trusted_issuers = dict(trusted_issuers)
 
-    def validate(
-        self,
-        token: str,
-        hosting_component: ResolvedHostingComponent,
-    ) -> ValidatedCallerAssertion:
+    def validate(self, token: str, hosting_component: ResolvedHostingComponent) -> ValidatedCallerAssertion:
         try:
             unverified = jwt.decode(
                 token,
@@ -139,14 +97,7 @@ class JwtTokenValidator:
 
 
 class HybridTokenValidator:
-    def __init__(
-        self,
-        domain_url: str,
-        trusted_issuers: Dict[str, Dict[str, Any]],
-        jwt_claim_overrides: List[str],
-        timeout_seconds: int = 30,
-        session: Any = requests,
-    ):
+    def __init__(self, domain_url: str, trusted_issuers: Dict[str, Dict[str, Any]], jwt_claim_overrides: List[str], timeout_seconds: int = 30, session: Any = requests):
         normalized_overrides = _normalize_claim_names(jwt_claim_overrides)
         if not normalized_overrides:
             raise ValueError("jwt_claim_overrides must contain at least one claim name.")
@@ -158,11 +109,7 @@ class HybridTokenValidator:
         self._jwt_validator = JwtTokenValidator(trusted_issuers)
         self._jwt_claim_overrides = normalized_overrides
 
-    def validate(
-        self,
-        token: str,
-        hosting_component: ResolvedHostingComponent,
-    ) -> ValidatedCallerAssertion:
+    def validate(self, token: str, hosting_component: ResolvedHostingComponent) -> ValidatedCallerAssertion:
         introspected = self._introspection_validator.validate(token, hosting_component)
         signed = self._jwt_validator.validate(token, hosting_component)
 
@@ -179,18 +126,15 @@ class HybridTokenValidator:
         )
 
 
-def _validated_from_claims(
-    claims: Dict[str, Any],
-    hosting_component: ResolvedHostingComponent,
-) -> ValidatedCallerAssertion:
-    audience = _normalize_audience(claims.get("aud"))
+def _validated_from_claims(claims: Dict[str, Any], hosting_component: ResolvedHostingComponent) -> ValidatedCallerAssertion:
+    audience = normalize_audience(claims.get("aud"))
     if hosting_component.resource_audiences:
         if not set(audience).intersection(hosting_component.resource_audiences):
             raise CallerAssertionValidationError(
                 "Incoming caller assertion audience does not match the selected hosting component."
             )
 
-    incoming_scopes = _normalize_scopes(claims.get("scope") or claims.get("scp"))
+    incoming_scopes = normalize_scopes(claims.get("scope") or claims.get("scp"))
     required_incoming_scopes = set(hosting_component.required_incoming_scopes)
     if required_incoming_scopes and not required_incoming_scopes.intersection(incoming_scopes):
         raise CallerAssertionValidationError(
@@ -206,45 +150,8 @@ def _validated_from_claims(
     )
 
 
-def _normalize_audience(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(item) for item in value if item]
-    return [str(value)]
-
-
-def _normalize_scopes(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        values = value.split()
-    elif isinstance(value, list):
-        values = value
-    else:
-        values = [value]
-
-    normalized = []
-    seen = set()
-    for item in values:
-        text = str(item).strip()
-        if text and text not in seen:
-            normalized.append(text)
-            seen.add(text)
-    return normalized
-
-
 def _normalize_claim_names(values: List[str]) -> List[str]:
-    normalized = []
-    seen = set()
-    for item in values or []:
-        text = str(item).strip()
-        if text and text not in seen:
-            normalized.append(text)
-            seen.add(text)
-    return normalized
+    return normalize_unique_strings(values or [])
 
 
 def _resolve_jwt_key(settings: Dict[str, Any], token: str) -> Any:

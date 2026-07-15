@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from ._errors import AuthorizationError, AuthorizationPolicyError
+from ._normalization import normalize_unique_strings
 
 
 @dataclass(frozen=True)
@@ -66,16 +67,7 @@ class VaultJsonAuthorizationPolicyProvider(AuthorizationPolicyProvider):
 
 
 class SignedVaultAuthorizationPolicyProvider(AuthorizationPolicyProvider):
-    def __init__(
-        self,
-        secret_ocid: str,
-        secret_reader: Callable[[str], str],
-        trusted_signers: List[Dict[str, str]],
-        expected_domain_url: str,
-        expected_environment: Optional[str] = None,
-        expected_tenant_id: Optional[str] = None,
-        now_provider: Optional[Callable[[], Any]] = None,
-    ):
+    def __init__(self, secret_ocid: str, secret_reader: Callable[[str], str], trusted_signers: List[Dict[str, str]], expected_domain_url: str, expected_environment: Optional[str] = None, expected_tenant_id: Optional[str] = None, now_provider: Optional[Callable[[], Any]] = None):
         self._secret_ocid = secret_ocid
         self._secret_reader = secret_reader
         self._trusted_signers = trusted_signers
@@ -109,14 +101,11 @@ class SignedVaultAuthorizationPolicyProvider(AuthorizationPolicyProvider):
 
 
 class GroupScopeAuthorizer:
-    def __init__(
-        self,
-        policy_or_provider: Optional[AuthorizationPolicy | AuthorizationPolicyProvider],
-    ):
+    def __init__(self, policy_or_provider: Optional[AuthorizationPolicy | AuthorizationPolicyProvider]):
         self._policy_or_provider = policy_or_provider
 
     def authorize(self, request: AuthorizationRequest) -> None:
-        requested_scopes = _normalize_values(request.scope.split())
+        requested_scopes = normalize_unique_strings(request.scope.split())
         if not requested_scopes:
             raise AuthorizationError("Requested scope must not be empty.")
 
@@ -125,7 +114,7 @@ class GroupScopeAuthorizer:
             raise AuthorizationError("No authorization policy is configured.")
 
         token_type_grants = policy.grants.get(request.token_type, {})
-        user_groups = _normalize_values(request.groups)
+        user_groups = normalize_unique_strings(request.groups)
         effective_scopes = set()
         for group in user_groups:
             effective_scopes.update(token_type_grants.get(group, []))
@@ -169,19 +158,12 @@ def _parse_policy(value: dict) -> AuthorizationPolicy:
         for group, scopes in group_grants.items():
             if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
                 raise AuthorizationPolicyError("Authorization policy scopes must be string lists.")
-            normalized_grants[str(token_type)][str(group)] = _normalize_values(scopes)
+            normalized_grants[str(token_type)][str(group)] = normalize_unique_strings(scopes)
 
     return AuthorizationPolicy(version=1, grants=normalized_grants)
 
 
-def _verify_signed_policy_envelope(
-    envelope: Any,
-    trusted_signers: List[Dict[str, str]],
-    expected_domain_url: str,
-    expected_environment: Optional[str],
-    expected_tenant_id: Optional[str],
-    now: datetime,
-) -> None:
+def _verify_signed_policy_envelope(envelope: Any, trusted_signers: List[Dict[str, str]], expected_domain_url: str, expected_environment: Optional[str], expected_tenant_id: Optional[str], now: datetime) -> None:
     if not isinstance(envelope, dict):
         raise AuthorizationPolicyError("Signed authorization policy envelope must be a JSON object.")
     if envelope.get("version") != 1:
@@ -226,10 +208,7 @@ def _verify_signed_policy_envelope(
         raise AuthorizationPolicyError(f"Signed authorization policy could not be verified: {exc}") from exc
 
 
-def _find_trusted_signer(
-    metadata: Dict[str, Any],
-    trusted_signers: List[Dict[str, str]],
-) -> Dict[str, str]:
+def _find_trusted_signer(metadata: Dict[str, Any], trusted_signers: List[Dict[str, str]]) -> Dict[str, str]:
     if metadata.get("signing_algorithm") != "SHA_256_RSA_PKCS_PSS":
         raise AuthorizationPolicyError("Signed authorization policy algorithm is unsupported.")
     for signer in trusted_signers:
@@ -289,12 +268,3 @@ def _base64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + ("=" * padding_length))
 
 
-def _normalize_values(values) -> List[str]:
-    normalized = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if text and text not in seen:
-            normalized.append(text)
-            seen.add(text)
-    return normalized

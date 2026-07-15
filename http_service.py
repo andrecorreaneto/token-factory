@@ -1,9 +1,12 @@
+"""Small HTTP adapter for TokenFactory request validation and response mapping."""
+
 import json
 from typing import Any, Dict, Optional
 
 from ._factory_support import (
     LOGGER,
     SUPPORTED_TOKEN_TYPES,
+    TOKEN_TYPES_REQUIRING_SCOPE,
     ConfigurationError,
     TokenExchangeError,
 )
@@ -14,9 +17,6 @@ from ._errors import (
     OAuthClientResolutionError,
 )
 from .factory import TokenFactory
-
-
-TOKEN_TYPES_REQUIRING_SCOPE = ("oracle-database", "oauth")
 
 
 def _extract_bearer_token(headers: Optional[Dict[str, str]]) -> Optional[str]:
@@ -31,6 +31,7 @@ def _extract_bearer_token(headers: Optional[Dict[str, str]]) -> Optional[str]:
 
 
 def coerce_payload(payload: Any) -> Dict[str, Any]:
+    """Coerce raw HTTP body input into the dictionary shape handled by TokenFactory."""
     if payload is None:
         return {}
     if isinstance(payload, dict):
@@ -68,13 +69,8 @@ def _extract_client_key(body: Dict[str, Any]) -> Optional[str]:
     return stripped
 
 
-def exchange_token(
-    incoming_access_token: str,
-    token_type: str,
-    scope: Optional[str],
-    config: Optional[Dict[str, Any]] = None,
-    client_key: Optional[str] = None,
-) -> Any:
+def exchange_token(incoming_access_token: str, token_type: str, scope: Optional[str], config: Optional[Dict[str, Any]] = None, client_key: Optional[str] = None) -> Any:
+    """Create a TokenFactory and exchange the incoming access token."""
     return TokenFactory(config).get_token(
         incoming_access_token,
         token_type,
@@ -83,11 +79,8 @@ def exchange_token(
     )
 
 
-def handle_request(
-    body: Dict[str, Any],
-    headers: Optional[Dict[str, str]] = None,
-    config: Optional[Dict[str, Any]] = None,
-):
+def handle_request(body: Dict[str, Any], headers: Optional[Dict[str, str]] = None, config: Optional[Dict[str, Any]] = None):
+    """Handle an HTTP-style token request and return status, headers, and JSON body."""
     token_type = body.get("token_type")
     LOGGER.info(
         "Handling token factory request token_type=%s body_token_present=%s header_token_present=%s scope_present=%s.",

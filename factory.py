@@ -1,14 +1,16 @@
+"""TokenFactory facade for converting caller or OCI credentials into downstream tokens."""
+
 import base64
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
-from urllib.parse import urlsplit
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import jwt
 import requests
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from oci.auth.signers import TokenExchangeSigner
 
@@ -20,15 +22,12 @@ from ._authorization import (
     StaticAuthorizationPolicyProvider,
     VaultJsonAuthorizationPolicyProvider,
 )
-from ._errors import CallerAssertionValidationError
-from ._errors import OAuthClientResolutionError
+from ._errors import CallerAssertionValidationError, OAuthClientResolutionError
 from ._factory_support import (
     ConfigurationError,
-    LOGGER,
     OCI_IDENTITY_AUDIENCE,
     SUPPORTED_TOKEN_TYPES,
     TokenExchangeError,
-    TokenFactoryConfig,
     _extract_identity_domain_id,
     _extract_token_exchange_signer_keypair_pem,
     _fetch_secret_value_from_oci,
@@ -37,6 +36,7 @@ from ._factory_support import (
     build_oci_request_signer,
     build_signer_credential_from_profile,
 )
+from ._normalization import normalize_scopes
 from ._oauth_client_resolution import (
     OAuthClientInfo,
     OAuthClientResolver,
@@ -57,18 +57,20 @@ _ORACLE_DATABASE_CREDENTIAL_SELECTORS = {
 }
 
 
+@dataclass(frozen=True)
+class CallerContext:
+    """Validated caller data used by assertion-backed token flows."""
+
+    hosting_component: ResolvedHostingComponent
+    validated_assertion: Any
+    subject: str
+    groups: list[str]
+
+
 class OracleDatabaseTokenResult(tuple):
-    def __new__(
-        cls,
-        db_token: str,
-        private_key_pem: str,
-        expires_in: int,
-        token_type: str,
-        issued_token_type: str,
-        *,
-        principal_mode: str,
-        expires_at_epoch: int,
-    ):
+    """Tuple-compatible Oracle Database token result with lifecycle attributes."""
+
+    def __new__(cls, db_token: str, private_key_pem: str, expires_in: int, token_type: str, issued_token_type: str, *, principal_mode: str, expires_at_epoch: int):
         value = tuple.__new__(
             cls,
             (db_token, private_key_pem, expires_in, token_type, issued_token_type),
@@ -85,53 +87,31 @@ class OracleDatabaseTokenResult(tuple):
 
 
 class TokenFactory:
-    def __init__(
-        self,
-        config_or_overrides: Optional[Union[TokenFactoryConfig, Dict[str, Any]]] = None,
-        *,
-        config: Optional[TokenFactoryConfig] = None,
-        runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None,
-        oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None,
-        oauth_client_resolver: Optional[OAuthClientResolver] = None,
-        authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None,
-        authorizer: Optional[GroupScopeAuthorizer] = None,
-        token_endpoint_session: Any = requests,
-        token_exchange_signer_cls: Any = TokenExchangeSigner,
-        signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem,
-        db_token_generator: Any = _generate_db_token_with_dataplane,
-        factory_oci_signer_builder: Any = _get_factory_oci_signer,
-        oci_signer_builder: Any = build_oci_request_signer,
-    ):
-        if config is not None and config_or_overrides is not None:
-            raise ValueError("Pass either config_or_overrides or config, not both.")
+    """Exchanges caller or OCI credentials for documented downstream token shapes."""
+
+    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = TokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer):
+        """Configure runtime settings, OAuth client resolution, authorization, and exchange clients."""
+        if config_overrides is not None and not isinstance(config_overrides, dict):
+            raise TypeError("TokenFactory expects no positional argument or a config overrides dict.")
         if oauth_apps is not None and oauth_client_resolver is not None:
             raise ValueError("Pass either oauth_apps or oauth_client_resolver, not both.")
 
-        legacy_config = _resolve_legacy_config(config_or_overrides, config)
         if isinstance(runtime_config, dict):
             runtime_config = TokenFactoryRuntimeConfig(**runtime_config)
         if runtime_config is None:
-            if legacy_config is not None:
-                runtime_config = TokenFactoryRuntimeConfig.from_legacy_config(legacy_config)
-            else:
-                runtime_config = TokenFactoryRuntimeConfig.from_env(
-                    config_or_overrides if isinstance(config_or_overrides, dict) else None
-                )
+            runtime_config = TokenFactoryRuntimeConfig.from_env(config_overrides)
 
         self._runtime_config = runtime_config
         self._authz_policy_enable = runtime_config.authz_policy_enable
-        self._legacy_config = legacy_config
-        self._oauth_client_resolver = (
-            oauth_client_resolver
-            or _resolver_from_oauth_apps(oauth_apps, runtime_config)
-        )
-        self._token_validator = _default_token_validator(runtime_config)
-        policy_provider = authorization_policy_provider or _default_policy_provider(
+        self._oauth_client_resolver = oauth_client_resolver or _resolver_from_oauth_apps(
+            oauth_apps,
             runtime_config,
-            legacy_config,
         )
+        policy_provider = authorization_policy_provider or _default_policy_provider(runtime_config)
         self._authorizer = authorizer or GroupScopeAuthorizer(policy_provider)
         self._token_endpoint_session = token_endpoint_session
+        self._token_validation_session = token_validation_session
+        self._token_validator = token_validator
         self._token_exchange_signer_cls = token_exchange_signer_cls
         self._signer_keypair_extractor = signer_keypair_extractor
         self._db_token_generator = db_token_generator
@@ -140,85 +120,27 @@ class TokenFactory:
 
     @classmethod
     def from_env(cls, config_overrides: Optional[Dict[str, Any]] = None) -> "TokenFactory":
+        """Build a TokenFactory from process environment and optional overrides."""
         return cls(config_overrides)
 
-    def get_token(
-        self,
-        credential: Credential,
-        token_type: str,
-        scope: Optional[str] = None,
-        *,
-        client_key: Optional[str] = None,
-    ) -> Any:
+    def get_token(self, credential: Credential, token_type: str, scope: Optional[str] = None, *, client_key: Optional[str] = None) -> Any:
+        """Exchange a caller credential for the requested documented token type."""
         credential, token_type = _normalize_get_token_arguments(credential, token_type)
         if token_type not in SUPPORTED_TOKEN_TYPES:
             supported = ", ".join(SUPPORTED_TOKEN_TYPES)
-            raise ValueError(
-                f"Unsupported token_type '{token_type}'. Supported values: {supported}"
-            )
+            raise ValueError(f"Unsupported token_type '{token_type}'. Supported values: {supported}")
+
         resolved_client_key = _require_client_key(client_key)
-        if token_type == "oauth" and credential is None:
-            if not scope:
-                raise ValueError(f"Scope is required for token_type '{token_type}'")
-            hosting_component = self._resolve_hosting_component(resolved_client_key)
-            return self._exchange_client_credentials_for_oauth(
-                scope,
-                hosting_component,
-            )
-        if token_type == "oracle-database":
-            if not scope:
-                raise ValueError(f"Scope is required for token_type '{token_type}'")
-            selector = _oracle_database_credential_selector(credential)
-            if selector == ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL:
-                _require_oci_principal_database_auth_mode(self._runtime_config)
-                return self._exchange_oracle_database_token_with_oci_principal(scope)
-            if selector == ORACLE_DATABASE_CREDENTIAL_PROCESS:
-                raise NotImplementedError(
-                    "oracle-database credential selector 'PROCESS' is reserved for "
-                    "future RPST process-principal support and is not implemented yet."
-                )
-        if not isinstance(credential, str) or not credential:
-            raise ValueError(
-                f"token_type '{token_type}' requires credential to be a non-empty caller assertion string."
-            )
-        if token_type in {"oauth", "oracle-database"} and not scope:
-            raise ValueError(f"Scope is required for token_type '{token_type}'")
-
-        context = self._validate_assertion(credential, resolved_client_key)
-        if token_type == "userid":
-            return {"issued_token_type": "userid", "user_id": context["subject"]}
         if token_type == "oauth":
-            issued_scope = _issued_scope_for_pass_through(scope or "")
-            self._authorize(context, token_type, scope or "")
-            if _validated_token_can_be_passed_through(context, issued_scope, scope or ""):
-                return _incoming_oauth_result(credential)
-            assertion = self._build_jwt_assertion(
-                context["subject"],
-                context["hosting_component"],
-                "oauth",
-            )
-            return self._exchange_assertion_for_oauth(
-                assertion,
-                scope,
-                context["hosting_component"],
-            )
+            return self._get_oauth_token(credential, scope, resolved_client_key)
         if token_type == "oracle-database":
-            self._authorize(context, token_type, scope or "")
-            return self._exchange_oracle_database_token(
-                context["subject"],
-                context["hosting_component"],
-                scope or "",
-            )
-        return self._exchange_oci_service_token(
-            context["subject"],
-            context["hosting_component"],
-        )
+            return self._get_oracle_database_token(credential, scope, resolved_client_key)
+        if token_type == "userid":
+            return self._get_userid_token(credential, resolved_client_key)
+        return self._get_oci_service_token(credential, resolved_client_key)
 
-    def get_token_with_oci_credential(
-        self,
-        credential: Credential,
-        scope: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    def get_token_with_oci_credential(self, credential: Credential, scope: Optional[str] = None) -> Dict[str, Any]:
+        """Exchange an OCI signer dictionary or profile name for an OAuth token."""
         signer_credential = self._resolve_oci_credential(credential)
         signer = self._oci_signer_builder(signer_credential)
         endpoint = f"{self._runtime_config.domain_url}/oauth2/v1/token"
@@ -239,58 +161,106 @@ class TokenFactory:
             auth=signer,
             timeout=self._runtime_config.timeout_seconds,
         )
-        data = _response_payload_or_raise(response, "OCI credential OAuth exchange")
-        return _oauth_result(data)
+        return _oauth_result(_response_payload_or_raise(response, "OCI credential OAuth exchange"))
 
-    def _validate_assertion(
-        self,
-        credential: str,
-        client_key: str,
-    ) -> Dict[str, Any]:
+    def _get_oauth_token(self, credential: Credential, scope: Optional[str], client_key: str) -> Dict[str, Any]:
+        requested_scope = _require_scope(scope, "oauth")
+        if credential is None:
+            hosting_component = self._resolve_hosting_component(
+                client_key,
+                require_signing_material=False,
+            )
+            return self._exchange_client_credentials_for_oauth(requested_scope, hosting_component)
+
+        assertion = _require_caller_assertion(credential, "oauth")
+        context = self._validate_assertion(assertion, client_key)
+        issued_scope = _issued_scope_for_pass_through(requested_scope)
+        self._authorize(context, "oauth", requested_scope)
+        if _validated_token_can_be_passed_through(context, issued_scope, requested_scope):
+            return _incoming_oauth_result(assertion)
+
+        jwt_assertion = self._build_jwt_assertion(context.subject, context.hosting_component, "oauth")
+        return self._exchange_assertion_for_oauth(
+            jwt_assertion,
+            requested_scope,
+            context.hosting_component,
+        )
+
+    def _get_oracle_database_token(self, credential: Credential, scope: Optional[str], client_key: str) -> OracleDatabaseTokenResult:
+        requested_scope = _require_scope(scope, "oracle-database")
+        selector = _oracle_database_credential_selector(credential)
+        if selector == ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL:
+            _require_oci_principal_database_auth_mode(self._runtime_config)
+            return self._exchange_oracle_database_token_with_oci_principal(requested_scope)
+        if selector == ORACLE_DATABASE_CREDENTIAL_PROCESS:
+            raise NotImplementedError(
+                "oracle-database credential selector 'PROCESS' is reserved for future RPST process-principal support and is not implemented yet."
+            )
+
+        assertion = _require_caller_assertion(credential, "oracle-database")
+        context = self._validate_assertion(assertion, client_key)
+        self._authorize(context, "oracle-database", requested_scope)
+        return self._exchange_oracle_database_token(context.subject, context.hosting_component, requested_scope)
+
+    def _get_userid_token(self, credential: Credential, client_key: str) -> Dict[str, Any]:
+        assertion = _require_caller_assertion(credential, "userid")
+        context = self._validate_assertion(assertion, client_key)
+        return {"issued_token_type": "userid", "user_id": context.subject}
+
+    def _get_oci_service_token(self, credential: Credential, client_key: str) -> Any:
+        assertion = _require_caller_assertion(credential, "oci-service")
+        context = self._validate_assertion(assertion, client_key)
+        return self._exchange_oci_service_token(context.subject, context.hosting_component)
+
+    def _validate_assertion(self, credential: str, client_key: str) -> CallerContext:
         hosting_component = self._resolve_hosting_component(client_key)
-        validated = self._token_validator.validate(credential, hosting_component)
+        validated = self._get_token_validator().validate(credential, hosting_component)
         subject = validated.claims.get(self._runtime_config.subject_claim)
         if not subject:
             raise CallerAssertionValidationError(
                 f"Validated caller assertion is missing subject claim '{self._runtime_config.subject_claim}'."
             )
-        groups = _normalize_groups(validated.claims.get(self._runtime_config.groups_claim, []))
-        return {
-            "hosting_component": hosting_component,
-            "validated_assertion": validated,
-            "subject": str(subject),
-            "groups": groups,
-        }
+        return CallerContext(
+            hosting_component=hosting_component,
+            validated_assertion=validated,
+            subject=str(subject),
+            groups=normalize_scopes(validated.claims.get(self._runtime_config.groups_claim, [])),
+        )
 
-    def _resolve_hosting_component(self, client_key: str) -> ResolvedHostingComponent:
-        if self._oauth_client_resolver is None:
-            raise OAuthClientResolutionError(
-                "TokenFactory.get_token requires oauth_apps or oauth_client_resolver."
+    def _get_token_validator(self) -> Any:
+        if self._token_validator is None:
+            self._token_validator = _default_token_validator(
+                self._runtime_config,
+                self._token_validation_session,
             )
-        return self._oauth_client_resolver.resolve(client_key)
+        return self._token_validator
 
-    def _authorize(self, context: Dict[str, Any], token_type: str, scope: str) -> None:
+    def _resolve_hosting_component(self, client_key: str, *, require_signing_material: bool = True) -> ResolvedHostingComponent:
+        if self._oauth_client_resolver is None:
+            raise OAuthClientResolutionError("TokenFactory.get_token requires oauth_apps or oauth_client_resolver.")
+        return self._oauth_client_resolver.resolve(
+            client_key,
+            require_signing_material=require_signing_material,
+        )
+
+    def _authorize(self, context: CallerContext, token_type: str, scope: str) -> None:
         if not self._authz_policy_enable:
             return
         self._authorizer.authorize(
             AuthorizationRequest(
-                subject=context["subject"],
-                groups=context["groups"],
+                subject=context.subject,
+                groups=context.groups,
                 token_type=token_type,
                 scope=scope,
             )
         )
 
-    def _build_jwt_assertion(
-        self,
-        subject: str,
-        hosting_component: ResolvedHostingComponent,
-        token_type: str,
-    ) -> str:
-        now = int(time.time())
+    def _build_jwt_assertion(self, subject: str, hosting_component: ResolvedHostingComponent, token_type: str) -> str:
         identity = hosting_component.oauth_identity
+        issuer, private_key_pem = _require_signing_identity(identity, hosting_component.client_key)
+        now = int(time.time())
         payload = {
-            "iss": identity.issuer,
+            "iss": issuer,
             "sub": subject,
             "aud": _jwt_audience(self._runtime_config, token_type),
             "iat": now,
@@ -302,19 +272,12 @@ class TokenFactory:
         if identity.kid:
             headers["kid"] = identity.kid
 
-        key = _load_private_key(identity.private_key_pem, identity.private_key_passphrase)
+        key = _load_private_key(private_key_pem, identity.private_key_passphrase)
         return jwt.encode(payload, key=key, algorithm="RS256", headers=headers)
 
-    def _exchange_assertion_for_oauth(
-        self,
-        assertion: str,
-        scope: Optional[str],
-        hosting_component: ResolvedHostingComponent,
-    ) -> Dict[str, Any]:
+    def _exchange_assertion_for_oauth(self, assertion: str, scope: Optional[str], hosting_component: ResolvedHostingComponent) -> Dict[str, Any]:
         identity = hosting_component.oauth_identity
-        credentials = base64.b64encode(
-            f"{identity.client_id}:{identity.client_secret}".encode("utf-8")
-        ).decode("utf-8")
+        credentials = base64.b64encode(f"{identity.client_id}:{identity.client_secret}".encode("utf-8")).decode("utf-8")
         request_data = {
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
             "assertion": assertion,
@@ -333,18 +296,10 @@ class TokenFactory:
         )
         return _oauth_result(_response_payload_or_raise(response, "OAuth exchange"))
 
-    def _exchange_client_credentials_for_oauth(
-        self,
-        scope: Optional[str],
-        hosting_component: ResolvedHostingComponent,
-    ) -> Dict[str, Any]:
+    def _exchange_client_credentials_for_oauth(self, scope: Optional[str], hosting_component: ResolvedHostingComponent) -> Dict[str, Any]:
         identity = hosting_component.oauth_identity
-        credentials = base64.b64encode(
-            f"{identity.client_id}:{identity.client_secret}".encode("utf-8")
-        ).decode("utf-8")
-        request_data = {
-            "grant_type": "client_credentials",
-        }
+        credentials = base64.b64encode(f"{identity.client_id}:{identity.client_secret}".encode("utf-8")).decode("utf-8")
+        request_data = {"grant_type": "client_credentials"}
         if scope:
             request_data["scope"] = scope
 
@@ -357,62 +312,26 @@ class TokenFactory:
             data=request_data,
             timeout=self._runtime_config.timeout_seconds,
         )
-        return _oauth_result(
-            _response_payload_or_raise(response, "OAuth client credentials exchange")
-        )
+        return _oauth_result(_response_payload_or_raise(response, "OAuth client credentials exchange"))
 
-    def _exchange_oci_service_token(
-        self,
-        subject: str,
-        hosting_component: ResolvedHostingComponent,
-    ) -> Any:
+    def _exchange_oci_service_token(self, subject: str, hosting_component: ResolvedHostingComponent) -> Any:
         assertion = self._build_jwt_assertion(subject, hosting_component, "oci-service")
         return self._build_upst_signer(assertion, hosting_component)
 
-    def _exchange_oracle_database_token(
-        self,
-        subject: str,
-        hosting_component: ResolvedHostingComponent,
-        scope: str,
-    ) -> OracleDatabaseTokenResult:
+    def _exchange_oracle_database_token(self, subject: str, hosting_component: ResolvedHostingComponent, scope: str) -> OracleDatabaseTokenResult:
         assertion = self._build_jwt_assertion(subject, hosting_component, "oracle-database")
         signer = self._build_upst_signer(assertion, hosting_component)
         public_key_pem, private_key_pem = self._signer_keypair_extractor(signer)
-        db_token = self._db_token_generator(
-            signer,
-            public_key_pem,
-            scope,
-            self._runtime_config,
-        )
-        return _oracle_database_token_result(
-            db_token,
-            private_key_pem,
-            principal_mode="user",
-        )
+        db_token = self._db_token_generator(signer, public_key_pem, scope, self._runtime_config)
+        return _oracle_database_token_result(db_token, private_key_pem, principal_mode="user")
 
-    def _exchange_oracle_database_token_with_oci_principal(
-        self,
-        scope: str,
-    ) -> OracleDatabaseTokenResult:
+    def _exchange_oracle_database_token_with_oci_principal(self, scope: str) -> OracleDatabaseTokenResult:
         signer = self._factory_oci_signer_builder(self._runtime_config)
         public_key_pem, private_key_pem = _generate_database_session_keypair_pem()
-        db_token = self._db_token_generator(
-            signer,
-            public_key_pem,
-            scope,
-            self._runtime_config,
-        )
-        return _oracle_database_token_result(
-            db_token,
-            private_key_pem,
-            principal_mode="oci_principal",
-        )
+        db_token = self._db_token_generator(signer, public_key_pem, scope, self._runtime_config)
+        return _oracle_database_token_result(db_token, private_key_pem, principal_mode="oci_principal")
 
-    def _build_upst_signer(
-        self,
-        assertion: str,
-        hosting_component: ResolvedHostingComponent,
-    ) -> Any:
+    def _build_upst_signer(self, assertion: str, hosting_component: ResolvedHostingComponent) -> Any:
         identity = hosting_component.oauth_identity
         domain_id = _extract_identity_domain_id(self._runtime_config.domain_url)
         return self._token_exchange_signer_cls(
@@ -432,25 +351,7 @@ class TokenFactory:
         raise ValueError("OCI credential must be a signer dictionary or OCI profile name.")
 
 
-def _resolve_legacy_config(
-    config_or_overrides: Optional[Union[TokenFactoryConfig, Dict[str, Any]]],
-    config: Optional[TokenFactoryConfig],
-) -> Optional[TokenFactoryConfig]:
-    if config is not None:
-        return config
-    if isinstance(config_or_overrides, TokenFactoryConfig):
-        return config_or_overrides
-    if config_or_overrides is None or isinstance(config_or_overrides, dict):
-        return None
-    raise TypeError(
-        "TokenFactory expects no arguments, a config overrides dict, or a TokenFactoryConfig instance."
-    )
-
-
-def _resolver_from_oauth_apps(
-    oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]],
-    runtime_config: TokenFactoryRuntimeConfig,
-) -> Optional[OAuthClientResolver]:
+def _resolver_from_oauth_apps(oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]], runtime_config: TokenFactoryRuntimeConfig) -> Optional[OAuthClientResolver]:
     if oauth_apps is None:
         return None
     if not oauth_apps:
@@ -465,10 +366,7 @@ def _resolver_from_oauth_apps(
     return StaticOAuthClientResolver(client_info)
 
 
-def _coerce_oauth_client_info(
-    client_key: str,
-    value: Union[Dict[str, Any], OAuthClientInfo],
-) -> OAuthClientInfo:
+def _coerce_oauth_client_info(client_key: str, value: Union[Dict[str, Any], OAuthClientInfo]) -> OAuthClientInfo:
     if not isinstance(client_key, str) or not client_key.strip():
         raise ValueError("oauth_apps keys must be non-empty strings.")
     if isinstance(value, OAuthClientInfo):
@@ -501,10 +399,19 @@ def _require_client_key(client_key: Optional[str]) -> str:
     return stripped
 
 
-def _normalize_get_token_arguments(
-    credential: Credential,
-    token_type: str,
-) -> Tuple[Credential, str]:
+def _require_scope(scope: Optional[str], token_type: str) -> str:
+    if not isinstance(scope, str) or not scope.strip():
+        raise ValueError(f"Scope is required for token_type '{token_type}'")
+    return scope.strip()
+
+
+def _require_caller_assertion(credential: Credential, token_type: str) -> str:
+    if not isinstance(credential, str) or not credential:
+        raise ValueError(f"token_type '{token_type}' requires credential to be a non-empty caller assertion string.")
+    return credential
+
+
+def _normalize_get_token_arguments(credential: Credential, token_type: str) -> Tuple[Credential, str]:
     if isinstance(credential, str) and credential in SUPPORTED_TOKEN_TYPES:
         if not isinstance(token_type, str) or token_type not in SUPPORTED_TOKEN_TYPES:
             return token_type, credential
@@ -520,15 +427,12 @@ def _oracle_database_credential_selector(credential: Credential) -> Optional[str
     return None
 
 
-def _require_oci_principal_database_auth_mode(
-    runtime_config: TokenFactoryRuntimeConfig,
-) -> None:
+def _require_oci_principal_database_auth_mode(runtime_config: TokenFactoryRuntimeConfig) -> None:
     oci_auth_mode = str(runtime_config.oci_auth_mode or "").strip().lower()
     if oci_auth_mode in {"", "instance-principal", "resource-principal"}:
         return
     raise ConfigurationError(
-        "oracle-database credential selector 'OCI_PRINCIPAL' supports only "
-        "TF_SHARED_OCI_AUTH_MODE=instance-principal or resource-principal."
+        "oracle-database credential selector 'OCI_PRINCIPAL' supports only TF_SHARED_OCI_AUTH_MODE=instance-principal or resource-principal."
     )
 
 
@@ -546,12 +450,7 @@ def _generate_database_session_keypair_pem() -> Tuple[str, str]:
     return public_key_pem, private_key_pem
 
 
-def _oracle_database_token_result(
-    db_token: str,
-    private_key_pem: str,
-    *,
-    principal_mode: str,
-) -> OracleDatabaseTokenResult:
+def _oracle_database_token_result(db_token: str, private_key_pem: str, *, principal_mode: str) -> OracleDatabaseTokenResult:
     expires_at_epoch = _expires_at_epoch(db_token)
     return OracleDatabaseTokenResult(
         db_token,
@@ -564,20 +463,12 @@ def _oracle_database_token_result(
     )
 
 
-def _default_policy_provider(
-    runtime_config: TokenFactoryRuntimeConfig,
-    legacy_config: Optional[TokenFactoryConfig],
-) -> AuthorizationPolicyProvider:
+def _default_policy_provider(runtime_config: TokenFactoryRuntimeConfig) -> AuthorizationPolicyProvider:
     if not runtime_config.authz_policy_secret_ocid:
         return StaticAuthorizationPolicyProvider(None)
 
     def read_secret(secret_ocid: str) -> str:
-        config_for_secret_read = legacy_config or runtime_config
-        return _fetch_secret_value_from_oci(
-            secret_ocid,
-            runtime_config.oci_region,
-            config_for_secret_read,
-        )
+        return _fetch_secret_value_from_oci(secret_ocid, runtime_config.oci_region, runtime_config)
 
     if runtime_config.authz_policy_signature_mode == "on":
         return SignedVaultAuthorizationPolicyProvider(
@@ -591,34 +482,28 @@ def _default_policy_provider(
     return VaultJsonAuthorizationPolicyProvider(runtime_config.authz_policy_secret_ocid, read_secret)
 
 
-def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig) -> Any:
+def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, session: Any = requests) -> Any:
     claim_overrides = [runtime_config.groups_claim or "groups"]
-    trusted_issuers = _discover_jwt_trusted_issuers(
-        runtime_config,
-        claim_overrides,
-    )
+    trusted_issuers = _discover_jwt_trusted_issuers(runtime_config, claim_overrides, session)
     return HybridTokenValidator(
         domain_url=runtime_config.domain_url,
         trusted_issuers=trusted_issuers,
         jwt_claim_overrides=claim_overrides,
         timeout_seconds=runtime_config.timeout_seconds,
+        session=session,
     )
 
 
-def _discover_jwt_trusted_issuers(
-    runtime_config: TokenFactoryRuntimeConfig,
-    required_claims: list[str],
-) -> Dict[str, Dict[str, Any]]:
+def _discover_jwt_trusted_issuers(runtime_config: TokenFactoryRuntimeConfig, required_claims: list[str], session: Any = requests) -> Dict[str, Dict[str, Any]]:
     discovery_url = f"{runtime_config.domain_url.rstrip('/')}/.well-known/openid-configuration"
     try:
-        response = requests.get(discovery_url, timeout=runtime_config.timeout_seconds)
+        response = session.get(discovery_url, timeout=runtime_config.timeout_seconds)
         metadata = response.json()
     except Exception as exc:
         raise ConfigurationError(f"OIDC discovery failed: {exc}") from exc
     if not getattr(response, "ok", True):
         raise ConfigurationError(
-            f"OIDC discovery failed [{getattr(response, 'status_code', 'unknown')}]: "
-            f"{getattr(response, 'text', '')}"
+            f"OIDC discovery failed [{getattr(response, 'status_code', 'unknown')}]: {getattr(response, 'text', '')}"
         )
     if not isinstance(metadata, dict):
         raise ConfigurationError("OIDC discovery response must be a JSON object.")
@@ -639,8 +524,7 @@ def _discover_jwt_trusted_issuers(
 def _response_payload_or_raise(response: Any, label: str) -> Dict[str, Any]:
     if not getattr(response, "ok", False):
         raise TokenExchangeError(
-            f"{label} failed [{getattr(response, 'status_code', 'unknown')}]: "
-            f"{getattr(response, 'text', '')}"
+            f"{label} failed [{getattr(response, 'status_code', 'unknown')}]: {getattr(response, 'text', '')}"
         )
     data = response.json()
     access_token = data.get("access_token") or data.get("token")
@@ -671,30 +555,24 @@ def _incoming_oauth_result(access_token: str) -> Dict[str, Any]:
     }
 
 
-def _validated_token_can_be_passed_through(
-    context: Dict[str, Any],
-    issued_scope: str,
-    requested_scope: str,
-) -> bool:
+def _validated_token_can_be_passed_through(context: CallerContext, issued_scope: str, requested_scope: str) -> bool:
     return _validated_token_has_scope(context, issued_scope) and _validated_token_has_audience(
         context,
         _resource_audience_for_request_scope(requested_scope),
     )
 
 
-def _validated_token_has_scope(context: Dict[str, Any], scope: str) -> bool:
-    validated = context.get("validated_assertion")
-    incoming_scopes = getattr(validated, "incoming_scopes", None)
+def _validated_token_has_scope(context: CallerContext, scope: str) -> bool:
+    incoming_scopes = getattr(context.validated_assertion, "incoming_scopes", None)
     if not incoming_scopes:
         return False
     return scope in set(incoming_scopes)
 
 
-def _validated_token_has_audience(context: Dict[str, Any], audience: Optional[str]) -> bool:
+def _validated_token_has_audience(context: CallerContext, audience: Optional[str]) -> bool:
     if audience is None:
         return True
-    validated = context.get("validated_assertion")
-    token_audience = getattr(validated, "audience", None)
+    token_audience = getattr(context.validated_assertion, "audience", None)
     if isinstance(token_audience, str):
         values = {token_audience}
     elif isinstance(token_audience, (list, tuple, set)):
@@ -718,46 +596,29 @@ def _resource_audience_for_request_scope(scope: str) -> Optional[str]:
     return None
 
 
-def _normalize_groups(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        values = value.split()
-    elif isinstance(value, list):
-        values = value
-    else:
-        values = [value]
-
-    normalized = []
-    seen = set()
-    for item in values:
-        text = str(item).strip()
-        if text and text not in seen:
-            normalized.append(text)
-            seen.add(text)
-    return normalized
-
-
 def _jwt_audience(runtime_config: TokenFactoryRuntimeConfig, token_type: str) -> str:
     if token_type in {"oracle-database", "oci-service"}:
         return f"{runtime_config.domain_url}/oauth2/v1/token"
     return OCI_IDENTITY_AUDIENCE
 
 
-def _propagation_trust_claim(
-    hosting_component: ResolvedHostingComponent,
-    token_type: str,
-) -> Dict[str, str]:
+def _propagation_trust_claim(hosting_component: ResolvedHostingComponent, token_type: str) -> Dict[str, str]:
     if token_type not in {"oracle-database", "oci-service"}:
         return {}
     if not hosting_component.propagation_trust_claim:
         return {}
     claim_name, separator, claim_value = hosting_component.propagation_trust_claim.partition(":")
     if separator != ":" or not claim_name.strip() or not claim_value.strip():
-        raise ConfigurationError(
-            "TF_CLIENT_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value"
-        )
+        raise ConfigurationError("TF_CLIENT_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value")
     return {claim_name.strip(): claim_value.strip()}
+
+
+def _require_signing_identity(identity: Any, client_key: str) -> Tuple[str, str]:
+    if not identity.issuer:
+        raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
+    if not identity.private_key_pem:
+        raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing private key.")
+    return identity.issuer, identity.private_key_pem
 
 
 def _load_private_key(private_key_pem: str, passphrase: Optional[str]):
@@ -782,14 +643,3 @@ def _expires_at_epoch(token: str) -> int:
     except Exception:
         pass
     return int(time.time()) + 3600
-
-
-__all__ = [
-    "ConfigurationError",
-    "ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL",
-    "ORACLE_DATABASE_CREDENTIAL_PROCESS",
-    "OracleDatabaseTokenResult",
-    "TokenExchangeError",
-    "TokenFactoryConfig",
-    "TokenFactory",
-]

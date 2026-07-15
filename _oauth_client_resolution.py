@@ -4,7 +4,6 @@ from typing import Callable, Dict, List, Optional
 from ._errors import OAuthClientResolutionError
 from ._factory_support import (
     _fetch_secret_value_from_oci,
-    _load_config,
     _parse_token_factory_credentials,
 )
 from ._runtime_config import TokenFactoryRuntimeConfig
@@ -33,8 +32,8 @@ class OAuthClientInfo:
 class OAuthClientIdentity:
     client_id: str
     client_secret: str
-    issuer: str
-    private_key_pem: str
+    issuer: Optional[str] = None
+    private_key_pem: Optional[str] = None
     certificate_pem: Optional[str] = None
     kid: Optional[str] = None
     private_key_passphrase: Optional[str] = None
@@ -50,10 +49,7 @@ class ResolvedHostingComponent:
 
 
 class OAuthClientResolver:
-    def resolve(
-        self,
-        client_key: Optional[str],
-    ) -> ResolvedHostingComponent:
+    def resolve(self, client_key: Optional[str], *, require_signing_material: bool = True) -> ResolvedHostingComponent:
         raise NotImplementedError
 
 
@@ -61,44 +57,11 @@ class StaticOAuthClientResolver(OAuthClientResolver):
     def __init__(self, client_info: Dict[str, OAuthClientInfo]):
         self._client_info = dict(client_info)
 
-    @classmethod
-    def from_env(
-        cls,
-        config_overrides: Optional[Dict[str, str]] = None,
-    ) -> "StaticOAuthClientResolver":
-        config = _load_config(config_overrides)
-        private_key_pem = config.assertion_key_pem or _read_text_file(config.assertion_key_path)
-        certificate_pem = config.assertion_cert_pem or _read_text_file(config.assertion_cert_path)
-        return cls(
-            {
-                "default": OAuthClientInfo(
-                    client_credentials=config.token_factory_creds,
-                    client_credentials_secret_ocid=config.token_factory_creds_ocid,
-                    issuer=config.jwt_issuer,
-                    private_key_pem=private_key_pem,
-                    private_key_secret_ocid=config.assertion_key_secret_ocid,
-                    private_key_passphrase=config.assertion_key_passphrase,
-                    private_key_passphrase_secret_ocid=config.assertion_key_passphrase_secret_ocid,
-                    certificate_pem=certificate_pem,
-                    certificate_secret_ocid=config.assertion_cert_secret_ocid,
-                    kid=config.assertion_kid,
-                    propagation_trust_claim=config.propagation_trust_claim,
-                    resource_audiences=["default"],
-                )
-            }
-        )
-
-    def resolve(
-        self,
-        client_key: Optional[str],
-    ) -> ResolvedHostingComponent:
+    def resolve(self, client_key: Optional[str], *, require_signing_material: bool = True) -> ResolvedHostingComponent:
         selected_client_key, info = self._select_client_info(client_key)
-        return self._resolve_info(selected_client_key, info, None)
+        return self._resolve_info(selected_client_key, info, None, require_signing_material)
 
-    def _select_client_info(
-        self,
-        client_key: Optional[str],
-    ) -> tuple[str, OAuthClientInfo]:
+    def _select_client_info(self, client_key: Optional[str]) -> tuple[str, OAuthClientInfo]:
         if isinstance(client_key, str) and client_key.strip():
             selected_client_key = client_key.strip()
             if selected_client_key not in self._client_info:
@@ -111,12 +74,7 @@ class StaticOAuthClientResolver(OAuthClientResolver):
             "client_key is required."
         )
 
-    def _resolve_info(
-        self,
-        client_key: str,
-        info: OAuthClientInfo,
-        secret_reader: Optional[Callable[[str], str]],
-    ) -> ResolvedHostingComponent:
+    def _resolve_info(self, client_key: str, info: OAuthClientInfo, secret_reader: Optional[Callable[[str], str]], require_signing_material: bool) -> ResolvedHostingComponent:
         client_id, client_secret = _parse_token_factory_credentials(
             _resolve_required_value(
                 direct_value=info.client_credentials,
@@ -126,24 +84,28 @@ class StaticOAuthClientResolver(OAuthClientResolver):
             ),
             "client credentials",
         )
-        private_key_pem = _resolve_required_value(
-            direct_value=info.private_key_pem or _read_text_file(info.private_key_path),
-            secret_ocid=info.private_key_secret_ocid,
-            secret_reader=secret_reader,
-            label="private key",
-        )
-        certificate_pem = _resolve_optional_value(
-            direct_value=info.certificate_pem or _read_text_file(info.certificate_path),
-            secret_ocid=info.certificate_secret_ocid,
-            secret_reader=secret_reader,
-        )
-        private_key_passphrase = _resolve_optional_value(
-            direct_value=info.private_key_passphrase,
-            secret_ocid=info.private_key_passphrase_secret_ocid,
-            secret_reader=secret_reader,
-        )
-        if not info.issuer:
-            raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
+        private_key_pem = None
+        certificate_pem = None
+        private_key_passphrase = None
+        if require_signing_material:
+            private_key_pem = _resolve_required_value(
+                direct_value=info.private_key_pem or _read_text_file(info.private_key_path),
+                secret_ocid=info.private_key_secret_ocid,
+                secret_reader=secret_reader,
+                label="private key",
+            )
+            certificate_pem = _resolve_optional_value(
+                direct_value=info.certificate_pem or _read_text_file(info.certificate_path),
+                secret_ocid=info.certificate_secret_ocid,
+                secret_reader=secret_reader,
+            )
+            private_key_passphrase = _resolve_optional_value(
+                direct_value=info.private_key_passphrase,
+                secret_ocid=info.private_key_passphrase_secret_ocid,
+                secret_reader=secret_reader,
+            )
+            if not info.issuer:
+                raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
 
         return ResolvedHostingComponent(
             client_key=client_key,
@@ -163,48 +125,33 @@ class StaticOAuthClientResolver(OAuthClientResolver):
 
 
 class VaultOAuthClientResolver(StaticOAuthClientResolver):
-    def __init__(
-        self,
-        client_info: Dict[str, OAuthClientInfo],
-        secret_reader: Optional[Callable[[str], str]] = None,
-        runtime_config: Optional[TokenFactoryRuntimeConfig] = None,
-        legacy_config: Optional[object] = None,
-    ):
+    def __init__(self, client_info: Dict[str, OAuthClientInfo], secret_reader: Optional[Callable[[str], str]] = None, runtime_config: Optional[TokenFactoryRuntimeConfig] = None):
         super().__init__(client_info)
         self._secret_reader = secret_reader
         self._runtime_config = runtime_config
-        self._legacy_config = legacy_config
 
-    def resolve(
-        self,
-        client_key: Optional[str],
-    ) -> ResolvedHostingComponent:
+    def resolve(self, client_key: Optional[str], *, require_signing_material: bool = True) -> ResolvedHostingComponent:
         selected_client_key, info = self._select_client_info(client_key)
-        return self._resolve_info(selected_client_key, info, self._read_secret)
+        return self._resolve_info(
+            selected_client_key,
+            info,
+            self._read_secret,
+            require_signing_material,
+        )
 
     def _read_secret(self, secret_ocid: str) -> str:
         if self._secret_reader:
             return self._secret_reader(secret_ocid)
-        config = self._legacy_config or self._runtime_config
+        config = self._runtime_config
         if config is None:
             raise OAuthClientResolutionError(
-                "VaultOAuthClientResolver requires secret_reader, runtime_config, or legacy_config."
+                "VaultOAuthClientResolver requires secret_reader or runtime_config."
             )
-        region = getattr(self._runtime_config, "oci_region", None)
+        region = getattr(config, "oci_region", None)
         return _fetch_secret_value_from_oci(secret_ocid, region, config)
 
 
-class LocalOAuthClientResolver(StaticOAuthClientResolver):
-    pass
-
-
-def _resolve_required_value(
-    *,
-    direct_value: Optional[str],
-    secret_ocid: Optional[str],
-    secret_reader: Optional[Callable[[str], str]],
-    label: str,
-) -> str:
+def _resolve_required_value(*, direct_value: Optional[str], secret_ocid: Optional[str], secret_reader: Optional[Callable[[str], str]], label: str) -> str:
     value = _resolve_optional_value(
         direct_value=direct_value,
         secret_ocid=secret_ocid,
@@ -215,12 +162,7 @@ def _resolve_required_value(
     return value
 
 
-def _resolve_optional_value(
-    *,
-    direct_value: Optional[str],
-    secret_ocid: Optional[str],
-    secret_reader: Optional[Callable[[str], str]],
-) -> Optional[str]:
+def _resolve_optional_value(*, direct_value: Optional[str], secret_ocid: Optional[str], secret_reader: Optional[Callable[[str], str]]) -> Optional[str]:
     if secret_ocid:
         if not secret_reader:
             raise OAuthClientResolutionError("Secret OCID configured but no secret reader is available.")
