@@ -26,6 +26,8 @@ from oci.identity_data_plane.models import GenerateScopedAccessTokenDetails
 from oci.secrets import SecretsClient
 from oci.signer import Signer
 
+from ._runtime_config import TokenFactoryRuntimeConfig
+
 
 _LOG_LEVELS = {
     "CRITICAL": logging.CRITICAL,
@@ -43,21 +45,21 @@ def _resolve_log_level(value: Optional[str]) -> Tuple[str, int]:
     normalized = "INFO" if value is None else str(value).strip().upper()
     if normalized not in _LOG_LEVELS:
         valid_values = ", ".join(_LOG_LEVELS)
-        raise ValueError(f"TOKEN_FACTORY_LOG_LEVEL must be one of: {valid_values}")
+        raise ValueError(f"TF_SHARED_LOG_LEVEL must be one of: {valid_values}")
     return normalized, _LOG_LEVELS[normalized]
 
 
-TOKEN_FACTORY_LOG_LEVEL, _LOG_LEVEL_NUMBER = _resolve_log_level(os.getenv("TOKEN_FACTORY_LOG_LEVEL"))
+TF_SHARED_LOG_LEVEL, _LOG_LEVEL_NUMBER = _resolve_log_level(os.getenv("TF_SHARED_LOG_LEVEL"))
 logging.basicConfig(level=_LOG_LEVEL_NUMBER)
 LOGGER = logging.getLogger("token_factory")
 LOGGER.setLevel(_LOG_LEVEL_NUMBER)
 
 
 def _apply_log_level(value: Any) -> None:
-    global TOKEN_FACTORY_LOG_LEVEL
+    global TF_SHARED_LOG_LEVEL
     global _LOG_LEVEL_NUMBER
 
-    TOKEN_FACTORY_LOG_LEVEL, _LOG_LEVEL_NUMBER = _resolve_log_level(value)
+    TF_SHARED_LOG_LEVEL, _LOG_LEVEL_NUMBER = _resolve_log_level(value)
     LOGGER.setLevel(_LOG_LEVEL_NUMBER)
 
 
@@ -100,16 +102,16 @@ _ASSERTION_SIGNING_CERTIFICATE_SOURCE = None
 _TOKEN_EXCHANGE_CREDS_CACHE: Dict[
     Tuple[Optional[str], Optional[str], Optional[str], str, str], Tuple[str, str]
 ] = {}
-SUPPORTED_TARGET_TOOLS = (
+SUPPORTED_TOKEN_TYPES = (
     "oracle-database",
     "oci-service",
     "oauth",
     "userid",
 )
-TARGET_TOOLS_REQUIRING_SCOPE = ("oracle-database",)
+TOKEN_TYPES_REQUIRING_SCOPE = ("oracle-database", "oauth")
 OCI_IDENTITY_AUDIENCE = "https://identity.oraclecloud.com/"
 _ALLOWED_OCI_AUTH_MODES = {"instance-principal", "oci-profile", "resource-principal"}
-_OCI_AUTH_MODE_ERROR = "TOKEN_FACTORY_OCI_AUTH_MODE must be one of: instance-principal, oci-profile, resource-principal"
+_OCI_AUTH_MODE_ERROR = "TF_SHARED_OCI_AUTH_MODE must be one of: instance-principal, oci-profile, resource-principal"
 
 
 def _config_value(name: str, config_overrides: Optional[Dict[str, Any]] = None, default: Optional[Any] = None, required: bool = False) -> Optional[Any]:
@@ -298,13 +300,13 @@ def _extract_identity_domain_id(domain_url: str) -> str:
     _log_method_entry("_extract_identity_domain_id", domain_url=domain_url)
     candidate = domain_url.strip()
     if not candidate:
-        raise ConfigurationError("TOKEN_FACTORY_DOMAIN_URL must not be empty.")
+        raise ConfigurationError("TF_SHARED_DOMAIN_URL must not be empty.")
 
     parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
     hostname = parsed.hostname
     if not hostname:
         raise ConfigurationError(
-            f"Unable to parse identity domain host from TOKEN_FACTORY_DOMAIN_URL '{domain_url}'."
+            f"Unable to parse identity domain host from TF_SHARED_DOMAIN_URL '{domain_url}'."
         )
 
     suffix = ".identity.oraclecloud.com"
@@ -317,7 +319,7 @@ def _extract_identity_domain_id(domain_url: str) -> str:
         return hostname
 
     raise ConfigurationError(
-        "Unable to derive identity domain ID from TOKEN_FACTORY_DOMAIN_URL. "
+        "Unable to derive identity domain ID from TF_SHARED_DOMAIN_URL. "
         "Expected a host like '<domain_id>.identity.oraclecloud.com'."
     )
 
@@ -352,68 +354,68 @@ def _normalize_oci_auth_mode(value: Any) -> str:
 
 def _load_config(config_overrides: Optional[Dict[str, Any]] = None) -> TokenFactoryConfig:
     _log_method_entry("_load_config", override_count=len(config_overrides or {}))
-    domain_url = str(_config_value("TOKEN_FACTORY_DOMAIN_URL", config_overrides, required=True)).rstrip("/")
-    domain_oci_region = str(_config_value("TOKEN_FACTORY_DOMAIN_REGION", config_overrides, required=True))
-    token_factory_creds_ocid = _config_value("TOKEN_FACTORY_CREDS_SECRET_OCID", config_overrides)
-    token_factory_creds = _config_value("TOKEN_FACTORY_CREDS", config_overrides)
+    domain_url = str(_config_value("TF_SHARED_DOMAIN_URL", config_overrides, required=True)).rstrip("/")
+    domain_oci_region = str(_config_value("TF_SHARED_DOMAIN_REGION", config_overrides, required=True))
+    token_factory_creds_ocid = _config_value("TF_CLIENT_CREDS_SECRET_OCID", config_overrides)
+    token_factory_creds = _config_value("TF_CLIENT_CREDS", config_overrides)
     if not token_factory_creds_ocid and not token_factory_creds:
         raise ConfigurationError(
-            "Provide one of: TOKEN_FACTORY_CREDS_SECRET_OCID or TOKEN_FACTORY_CREDS"
+            "Provide one of: TF_CLIENT_CREDS_SECRET_OCID or TF_CLIENT_CREDS"
         )
-    jwt_issuer = str(_config_value("TOKEN_FACTORY_ISSUER", config_overrides, required=True))
+    jwt_issuer = str(_config_value("TF_CLIENT_ISSUER", config_overrides, required=True))
     propagation_trust_claim = _config_value(
-        "TOKEN_FACTORY_PROPAGATION_TRUST_CLAIM",
+        "TF_CLIENT_PROPAGATION_TRUST_CLAIM",
         config_overrides,
     )
     log_full_assertion = _coerce_bool(
-        _config_value("TOKEN_FACTORY_LOG_FULL_ASSERTION", config_overrides, False),
-        "TOKEN_FACTORY_LOG_FULL_ASSERTION",
+        _config_value("TF_SHARED_LOG_FULL_ASSERTION", config_overrides, False),
+        "TF_SHARED_LOG_FULL_ASSERTION",
     )
     oci_auth_mode = _normalize_oci_auth_mode(
-        _config_value("TOKEN_FACTORY_OCI_AUTH_MODE", config_overrides, "instance-principal")
+        _config_value("TF_SHARED_OCI_AUTH_MODE", config_overrides, "instance-principal")
     )
-    oci_auth_profile_raw = _config_value("TOKEN_FACTORY_OCI_AUTH_PROFILE", config_overrides, "DEFAULT")
+    oci_auth_profile_raw = _config_value("TF_SHARED_OCI_AUTH_PROFILE", config_overrides, "DEFAULT")
     oci_auth_profile_candidate = (
         str(oci_auth_profile_raw).strip() if oci_auth_profile_raw is not None else ""
     )
     oci_auth_profile = oci_auth_profile_candidate or "DEFAULT"
-    timeout_raw = _config_value("TOKEN_FACTORY_TIMEOUT_SECONDS", config_overrides, "30")
+    timeout_raw = _config_value("TF_SHARED_TIMEOUT_SECONDS", config_overrides, "30")
     try:
         timeout = int(timeout_raw)
     except ValueError as exc:
         raise ConfigurationError(
-            f"TOKEN_FACTORY_TIMEOUT_SECONDS must be an integer, got '{timeout_raw}'"
+            f"TF_SHARED_TIMEOUT_SECONDS must be an integer, got '{timeout_raw}'"
         ) from exc
 
-    assertion_key_path = _config_value("TOKEN_FACTORY_PRIVATE_KEY_PATH", config_overrides)
-    assertion_key_pem = _config_value("TOKEN_FACTORY_PRIVATE_KEY_PEM", config_overrides)
+    assertion_key_path = _config_value("TF_CLIENT_PRIVATE_KEY_PATH", config_overrides)
+    assertion_key_pem = _config_value("TF_CLIENT_PRIVATE_KEY_PEM", config_overrides)
     assertion_key_secret_ocid = _config_value(
-        "TOKEN_FACTORY_PRIVATE_KEY_SECRET_OCID", config_overrides
+        "TF_CLIENT_PRIVATE_KEY_SECRET_OCID", config_overrides
     )
-    assertion_cert_path = _config_value("TOKEN_FACTORY_CERT_PATH", config_overrides)
-    assertion_cert_pem = _config_value("TOKEN_FACTORY_CERT_PEM", config_overrides)
+    assertion_cert_path = _config_value("TF_CLIENT_CERT_PATH", config_overrides)
+    assertion_cert_pem = _config_value("TF_CLIENT_CERT_PEM", config_overrides)
     assertion_cert_secret_ocid = _config_value(
-        "TOKEN_FACTORY_CERT_SECRET_OCID", config_overrides
+        "TF_CLIENT_CERT_SECRET_OCID", config_overrides
     )
-    assertion_kid = _config_value("TOKEN_FACTORY_KID", config_overrides)
+    assertion_kid = _config_value("TF_CLIENT_KID", config_overrides)
     assertion_key_passphrase = _config_value(
-        "TOKEN_FACTORY_PRIVATE_KEY_PASSPHRASE", config_overrides
+        "TF_CLIENT_PRIVATE_KEY_PASSPHRASE", config_overrides
     )
     assertion_key_passphrase_secret_ocid = _config_value(
-        "TOKEN_FACTORY_PRIVATE_KEY_PASSPHRASE_SECRET_OCID", config_overrides
+        "TF_CLIENT_PRIVATE_KEY_PASSPHRASE_SECRET_OCID", config_overrides
     )
-    assertion_oci_region = _config_value("TOKEN_FACTORY_OCI_REGION", config_overrides)
+    assertion_oci_region = _config_value("TF_SHARED_OCI_REGION", config_overrides)
 
     if not any([assertion_key_path, assertion_key_pem, assertion_key_secret_ocid]):
         raise ConfigurationError(
-            "Provide at least one of: TOKEN_FACTORY_PRIVATE_KEY_PEM, "
-            "TOKEN_FACTORY_PRIVATE_KEY_SECRET_OCID, or TOKEN_FACTORY_PRIVATE_KEY_PATH"
+            "Provide at least one of: TF_CLIENT_PRIVATE_KEY_PEM, "
+            "TF_CLIENT_PRIVATE_KEY_SECRET_OCID, or TF_CLIENT_PRIVATE_KEY_PATH"
         )
 
     if not any([assertion_cert_path, assertion_cert_pem, assertion_cert_secret_ocid]):
         raise ConfigurationError(
-            "Provide at least one of: TOKEN_FACTORY_CERT_PEM, "
-            "TOKEN_FACTORY_CERT_SECRET_OCID, or TOKEN_FACTORY_CERT_PATH"
+            "Provide at least one of: TF_CLIENT_CERT_PEM, "
+            "TF_CLIENT_CERT_SECRET_OCID, or TF_CLIENT_CERT_PATH"
         )
 
     LOGGER.info(
@@ -438,7 +440,7 @@ def _load_config(config_overrides: Optional[Dict[str, Any]] = None) -> TokenFact
         "Optional JWT propagation trust claim configured=%s source=%s.",
         bool(propagation_trust_claim),
         "override-dict"
-        if config_overrides and "TOKEN_FACTORY_PROPAGATION_TRUST_CLAIM" in config_overrides
+        if config_overrides and "TF_CLIENT_PROPAGATION_TRUST_CLAIM" in config_overrides
         else "environment",
     )
     LOGGER.info("Full JWT assertion logging enabled=%s.", log_full_assertion)
@@ -482,11 +484,11 @@ def _resolve_secret_region(secret_ocid: str, explicit_region: Optional[str]) -> 
         return parts[3]
     raise ConfigurationError(
         f"Unable to determine OCI region for secret {secret_ocid}. "
-        "Set TOKEN_FACTORY_OCI_REGION explicitly."
+        "Set TF_SHARED_OCI_REGION explicitly."
     )
 
 
-def _get_factory_oci_signer(config: TokenFactoryConfig):
+def _get_factory_oci_signer(config: Any):
     _log_method_entry("_get_factory_oci_signer", oci_auth_mode=config.oci_auth_mode, oci_auth_profile=config.oci_auth_profile)
     if config.oci_auth_mode == "resource-principal":
         try:
@@ -529,7 +531,7 @@ def _get_factory_oci_signer(config: TokenFactoryConfig):
 
 
 def _fetch_secret_value_from_oci(
-    secret_ocid: str, region: Optional[str], config: TokenFactoryConfig
+    secret_ocid: str, region: Optional[str], config: Any
 ) -> str:
     _log_method_entry(
         "_fetch_secret_value_from_oci",
@@ -626,13 +628,13 @@ def _get_token_exchange_credentials(config: TokenFactoryConfig) -> Tuple[str, st
         )
         credentials = _parse_token_factory_credentials(
             raw_value,
-            "TOKEN_FACTORY_CREDS_SECRET_OCID secret",
+            "TF_CLIENT_CREDS_SECRET_OCID secret",
         )
     else:
-        LOGGER.info("Resolving token factory credentials from TOKEN_FACTORY_CREDS.")
+        LOGGER.info("Resolving token factory credentials from TF_CLIENT_CREDS.")
         credentials = _parse_token_factory_credentials(
             config.token_factory_creds or "",
-            "TOKEN_FACTORY_CREDS",
+            "TF_CLIENT_CREDS",
         )
     _TOKEN_EXCHANGE_CREDS_CACHE[cache_key] = credentials
     LOGGER.info(
@@ -676,11 +678,11 @@ def _load_assertion_signing_key(config: TokenFactoryConfig):
 
     LOGGER.info(
         "JWT assertion signing key retrieval order: "
-        "TOKEN_FACTORY_PRIVATE_KEY_SECRET_OCID -> TOKEN_FACTORY_PRIVATE_KEY_PATH -> TOKEN_FACTORY_PRIVATE_KEY_PEM."
+        "TF_CLIENT_PRIVATE_KEY_SECRET_OCID -> TF_CLIENT_PRIVATE_KEY_PATH -> TF_CLIENT_PRIVATE_KEY_PEM."
     )
     if config.assertion_key_secret_ocid:
         LOGGER.info(
-            "Loading JWT assertion signing key from TOKEN_FACTORY_PRIVATE_KEY_SECRET_OCID."
+            "Loading JWT assertion signing key from TF_CLIENT_PRIVATE_KEY_SECRET_OCID."
         )
         key_bytes = _fetch_secret_value_from_oci(
             config.assertion_key_secret_ocid,
@@ -691,17 +693,17 @@ def _load_assertion_signing_key(config: TokenFactoryConfig):
         key_path = Path(config.assertion_key_path)
         if not key_path.exists():
             raise ConfigurationError(f"JWT assertion key file not found: {key_path}")
-        LOGGER.info("Loading JWT assertion signing key from TOKEN_FACTORY_PRIVATE_KEY_PATH.")
+        LOGGER.info("Loading JWT assertion signing key from TF_CLIENT_PRIVATE_KEY_PATH.")
         key_bytes = key_path.read_bytes()
     elif config.assertion_key_pem:
-        LOGGER.info("Loading JWT assertion signing key from TOKEN_FACTORY_PRIVATE_KEY_PEM.")
+        LOGGER.info("Loading JWT assertion signing key from TF_CLIENT_PRIVATE_KEY_PEM.")
         key_bytes = config.assertion_key_pem.encode("utf-8")
     else:
         raise ConfigurationError("JWT assertion key path is not configured.")
 
     if config.assertion_key_passphrase_secret_ocid:
         LOGGER.info(
-            "Loading JWT assertion signing key passphrase from TOKEN_FACTORY_PRIVATE_KEY_PASSPHRASE_SECRET_OCID."
+            "Loading JWT assertion signing key passphrase from TF_CLIENT_PRIVATE_KEY_PASSPHRASE_SECRET_OCID."
         )
         passphrase = _fetch_secret_value_from_oci(
             config.assertion_key_passphrase_secret_ocid,
@@ -737,12 +739,12 @@ def _load_assertion_signing_certificate(config: TokenFactoryConfig) -> Optional[
     )
     LOGGER.info(
         "JWT assertion certificate retrieval order: "
-        "TOKEN_FACTORY_CERT_SECRET_OCID -> TOKEN_FACTORY_CERT_PATH -> TOKEN_FACTORY_CERT_PEM."
+        "TF_CLIENT_CERT_SECRET_OCID -> TF_CLIENT_CERT_PATH -> TF_CLIENT_CERT_PEM."
     )
     if not any(source_key[:3]):
         LOGGER.info(
             "No JWT assertion certificate source is configured; x5t will be omitted unless "
-            "TOKEN_FACTORY_KID is provided."
+            "TF_CLIENT_KID is provided."
         )
         return None
     if (
@@ -754,7 +756,7 @@ def _load_assertion_signing_certificate(config: TokenFactoryConfig) -> Optional[
 
     if config.assertion_cert_secret_ocid:
         LOGGER.info(
-            "Attempting JWT assertion certificate load from TOKEN_FACTORY_CERT_SECRET_OCID."
+            "Attempting JWT assertion certificate load from TF_CLIENT_CERT_SECRET_OCID."
         )
         cert_bytes = _fetch_secret_value_from_oci(
             config.assertion_cert_secret_ocid,
@@ -762,13 +764,13 @@ def _load_assertion_signing_certificate(config: TokenFactoryConfig) -> Optional[
             config,
         ).encode("utf-8")
     elif config.assertion_cert_path:
-        LOGGER.info("Attempting JWT assertion certificate load from TOKEN_FACTORY_CERT_PATH.")
+        LOGGER.info("Attempting JWT assertion certificate load from TF_CLIENT_CERT_PATH.")
         cert_path = Path(config.assertion_cert_path)
         if not cert_path.exists():
             raise ConfigurationError(f"JWT assertion certificate file not found: {cert_path}")
         cert_bytes = cert_path.read_bytes()
     elif config.assertion_cert_pem:
-        LOGGER.info("Attempting JWT assertion certificate load from TOKEN_FACTORY_CERT_PEM.")
+        LOGGER.info("Attempting JWT assertion certificate load from TF_CLIENT_CERT_PEM.")
         cert_bytes = config.assertion_cert_pem.encode("utf-8")
     else:
         raise ConfigurationError("JWT assertion certificate path is not configured.")
@@ -981,14 +983,22 @@ def _exchange_assertion_for_oauth(assertion: str, scope: Optional[str], config: 
     return data
 
 
-def _generate_db_token_with_dataplane(signer: Any, public_key_pem: str, scope: str, config: TokenFactoryConfig) -> str:
-    _log_method_entry("_generate_db_token_with_dataplane", signer_type=type(signer).__name__, public_key_present=bool(public_key_pem), scope=scope, domain_region=config.domain_oci_region)
+def _generate_db_token_with_dataplane(
+    signer: Any,
+    public_key_pem: str,
+    scope: str,
+    config: TokenFactoryRuntimeConfig,
+) -> str:
+    domain_region = getattr(config, "domain_region", None)
+    if not domain_region:
+        raise ConfigurationError("TokenFactory domain region is required for database token generation.")
+    _log_method_entry("_generate_db_token_with_dataplane", signer_type=type(signer).__name__, public_key_present=bool(public_key_pem), scope=scope, domain_region=domain_region)
     LOGGER.info(
         "Requesting Oracle Database scoped access token domain_region=%s scope=%s.",
-        config.domain_oci_region,
+        domain_region,
         _truncate_for_log(scope, 120),
     )
-    client = DataplaneClient(config={"region": config.domain_oci_region}, signer=signer)
+    client = DataplaneClient(config={"region": domain_region}, signer=signer)
     details = GenerateScopedAccessTokenDetails(
         scope=scope,
         public_key=public_key_pem,
@@ -999,16 +1009,16 @@ def _generate_db_token_with_dataplane(signer: Any, public_key_pem: str, scope: s
     return response.data.token
 
 
-def _resolve_jwt_assertion_audience(config: TokenFactoryConfig, target_tool: str) -> str:
-    _log_method_entry("_resolve_jwt_assertion_audience", target_tool=target_tool, domain=config.domain_url)
-    if target_tool in ("oracle-database", "oci-service"):
+def _resolve_jwt_assertion_audience(config: TokenFactoryConfig, token_type: str) -> str:
+    _log_method_entry("_resolve_jwt_assertion_audience", token_type=token_type, domain=config.domain_url)
+    if token_type in ("oracle-database", "oci-service"):
         return f"{config.domain_url}/oauth2/v1/token"
-    if target_tool in ("oauth", "userid"):
+    if token_type in ("oauth", "userid"):
         return OCI_IDENTITY_AUDIENCE
 
-    supported = ", ".join(SUPPORTED_TARGET_TOOLS)
+    supported = ", ".join(SUPPORTED_TOKEN_TYPES)
     raise ValueError(
-        f"Unsupported target_tool '{target_tool}' for JWT assertion. Supported values: {supported}"
+        f"Unsupported token_type '{token_type}' for JWT assertion. Supported values: {supported}"
     )
 
 
@@ -1035,9 +1045,9 @@ def _resolve_jwt_assertion_x5t(config: TokenFactoryConfig) -> Optional[str]:
     return base64.urlsafe_b64encode(thumbprint).rstrip(b"=").decode("utf-8")
 
 
-def _resolve_jwt_assertion_header_claims(config: TokenFactoryConfig, target_tool: str) -> Dict[str, str]:
-    _log_method_entry("_resolve_jwt_assertion_header_claims", target_tool=target_tool, kid_configured=bool(config.assertion_kid))
-    if target_tool in ("oauth", "userid"):
+def _resolve_jwt_assertion_header_claims(config: TokenFactoryConfig, token_type: str) -> Dict[str, str]:
+    _log_method_entry("_resolve_jwt_assertion_header_claims", token_type=token_type, kid_configured=bool(config.assertion_kid))
+    if token_type in ("oauth", "userid"):
         if config.assertion_kid:
             return {"kid": config.assertion_kid}
 
@@ -1047,7 +1057,7 @@ def _resolve_jwt_assertion_header_claims(config: TokenFactoryConfig, target_tool
 
         LOGGER.info(
             "No x5t or kid is configured for %s; Falling back to identity domain SIGNING_KEY alias.",
-            target_tool,
+            token_type,
         )
         return {}
 
@@ -1061,14 +1071,14 @@ def _parse_propagation_trust_claim(raw_value: str) -> Tuple[str, str]:
     claim_value = claim_value.strip()
     if separator != ":" or not claim_name or not claim_value:
         raise ConfigurationError(
-            "TOKEN_FACTORY_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value"
+            "TF_CLIENT_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value"
         )
     return claim_name, claim_value
 
 
-def _resolve_propagation_trust_claim(config: TokenFactoryConfig, target_tool: str) -> Dict[str, str]:
-    _log_method_entry("_resolve_propagation_trust_claim", target_tool=target_tool, configured=bool(config.propagation_trust_claim))
-    if target_tool not in ("oracle-database", "oci-service"):
+def _resolve_propagation_trust_claim(config: TokenFactoryConfig, token_type: str) -> Dict[str, str]:
+    _log_method_entry("_resolve_propagation_trust_claim", token_type=token_type, configured=bool(config.propagation_trust_claim))
+    if token_type not in ("oracle-database", "oci-service"):
         return {}
     if not config.propagation_trust_claim:
         return {}
@@ -1077,12 +1087,12 @@ def _resolve_propagation_trust_claim(config: TokenFactoryConfig, target_tool: st
     return {claim_name: claim_value}
 
 
-def build_jwt_assertion(incoming_access_token: str, config: TokenFactoryConfig, target_tool: str) -> str:
-    _log_method_entry("build_jwt_assertion", target_tool=target_tool, domain=config.domain_url, credential_kind="access_token")
+def build_jwt_assertion(incoming_access_token: str, config: TokenFactoryConfig, token_type: str) -> str:
+    _log_method_entry("build_jwt_assertion", token_type=token_type, domain=config.domain_url, credential_kind="access_token")
     now = int(time.time())
-    header_claims = _resolve_jwt_assertion_header_claims(config, target_tool)
-    audience = _resolve_jwt_assertion_audience(config, target_tool)
-    propagation_trust_claim = _resolve_propagation_trust_claim(config, target_tool)
+    header_claims = _resolve_jwt_assertion_header_claims(config, token_type)
+    audience = _resolve_jwt_assertion_audience(config, token_type)
+    propagation_trust_claim = _resolve_propagation_trust_claim(config, token_type)
     payload = {
         "iss": config.jwt_issuer,
         "sub": _extract_subject(incoming_access_token),
@@ -1095,8 +1105,8 @@ def build_jwt_assertion(incoming_access_token: str, config: TokenFactoryConfig, 
     header = {"alg": "RS256", "typ": "JWT"}
     header.update(header_claims)
     LOGGER.info(
-        "Building JWT assertion target_tool=%s audience=%s header_claims=%s propagation_claims=%s.",
-        target_tool,
+        "Building JWT assertion token_type=%s audience=%s header_claims=%s propagation_claims=%s.",
+        token_type,
         audience,
         ",".join(sorted(header_claims.keys())) if header_claims else "none",
         ",".join(sorted(propagation_trust_claim.keys())) if propagation_trust_claim else "none",
@@ -1137,8 +1147,8 @@ __all__ = [
     "ConfigurationError",
     "LOGGER",
     "OCI_IDENTITY_AUDIENCE",
-    "SUPPORTED_TARGET_TOOLS",
-    "TARGET_TOOLS_REQUIRING_SCOPE",
+    "SUPPORTED_TOKEN_TYPES",
+    "TOKEN_TYPES_REQUIRING_SCOPE",
     "TokenExchangeError",
     "TokenFactoryConfig",
     "_exchange_assertion_for_oauth",

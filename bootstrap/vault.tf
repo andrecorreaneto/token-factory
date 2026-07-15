@@ -26,64 +26,68 @@ resource "oci_kms_key" "this" {
 }
 
 resource "oci_vault_secret" "client_credentials" {
-  count = var.enable_oci_secrets ? 1 : 0
+  for_each = var.enable_oci_secrets ? var.oauth_apps : {}
 
   compartment_id = var.oci_secrets_compartment_ocid
-  description    = local.descriptions.client_credentials
+  description    = local.descriptions.oauth_apps[each.key].client_credentials
   key_id         = local.master_key_id
-  secret_name    = local.names.client_credentials
+  secret_name    = local.names.oauth_apps[each.key].client_credentials
   vault_id       = local.vault_id
 
   secret_content {
-    content      = base64encode(local.client_credentials)
+    content      = base64encode(local.client_credentials[each.key])
     content_type = "BASE64"
     name         = "current"
   }
 }
 
-resource "oci_vault_secret" "private_key" {
-  count = local.create_vault_key_material ? 1 : 0
+resource "oci_vault_secret" "private_keys" {
+  for_each = local.vault_key_material_components
 
   compartment_id = var.oci_secrets_compartment_ocid
-  description    = local.descriptions.private_key
+  description    = local.descriptions.oauth_apps[each.key].private_key
   key_id         = local.master_key_id
-  secret_name    = local.names.private_key
+  secret_name    = local.names.oauth_apps[each.key].private_key
   vault_id       = local.vault_id
 
   secret_content {
-    content      = base64encode(local.jwt_private_key_pem_value)
+    content      = base64encode(local.jwt_private_key_pem_values[each.key])
     content_type = "BASE64"
     name         = "current"
   }
 }
 
-resource "oci_vault_secret" "private_key_passphrase" {
-  count = local.create_vault_key_material && var.jwt_private_key_passphrase != null ? 1 : 0
+resource "oci_vault_secret" "private_key_passphrases" {
+  for_each = {
+    for key, component in local.vault_key_material_components :
+    key => component
+    if component.jwt_private_key_passphrase != null
+  }
 
   compartment_id = var.oci_secrets_compartment_ocid
-  description    = local.descriptions.private_key_passphrase
+  description    = local.descriptions.oauth_apps[each.key].private_key_passphrase
   key_id         = local.master_key_id
-  secret_name    = local.names.private_key_passphrase
+  secret_name    = local.names.oauth_apps[each.key].private_key_passphrase
   vault_id       = local.vault_id
 
   secret_content {
-    content      = base64encode(var.jwt_private_key_passphrase)
+    content      = base64encode(each.value.jwt_private_key_passphrase)
     content_type = "BASE64"
     name         = "current"
   }
 }
 
-resource "oci_vault_secret" "certificate" {
-  count = local.create_vault_key_material ? 1 : 0
+resource "oci_vault_secret" "certificates" {
+  for_each = local.vault_key_material_components
 
   compartment_id = var.oci_secrets_compartment_ocid
-  description    = local.descriptions.certificate
+  description    = local.descriptions.oauth_apps[each.key].certificate
   key_id         = local.master_key_id
-  secret_name    = local.names.certificate
+  secret_name    = local.names.oauth_apps[each.key].certificate
   vault_id       = local.vault_id
 
   secret_content {
-    content      = base64encode(local.jwt_certificate_pem_value)
+    content      = base64encode(local.jwt_certificate_pem_values[each.key])
     content_type = "BASE64"
     name         = "current"
   }

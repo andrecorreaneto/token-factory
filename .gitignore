@@ -1,26 +1,16 @@
-# Terraform working directories and provider selections
-**/.terraform/
-**/.terraform.lock.hcl
-
-# Terraform state and state locks
-**/*.tfstate
-**/*.tfstate.*
-**/.terraform.tfstate.lock.info
-
-# Terraform plan outputs
-**/*.tfplan
-**/*.tfplan.json
-**/*.plan
-
-# Local client variable values
-**/*.tfvars
-
-# Terraform crash logs
-**/crash.log
-**/crash.*.log
-
-# Local override files
-**/override.tf
-**/override.tf.json
-**/*_override.tf
-**/*_override.tf.json
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+docs/superpowers/*
+*.tfvars
