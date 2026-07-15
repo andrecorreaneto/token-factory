@@ -30,7 +30,7 @@ Credentials that refer to OCI signer dictionaries and OCI CLI profile names do n
 
 | Parameter | Required | Description |
 | --- | --- | --- |
-| `credential` | depends on flow | Incoming caller assertion string, usually an Identity Domain access token for the hosting application. Pass `None` only for `token_type="oauth"` when requesting an application-only client credentials token. |
+| `credential` | depends on flow | Incoming caller assertion string, usually an Identity Domain access token for the hosting application. Pass `None` only for `token_type="oauth"` when requesting an application-only client credentials token. For `token_type="oracle-database"`, the reserved string `OCI_PRINCIPAL` requests an OCI instance/resource principal database token, and `PROCESS` is reserved for future RPST support. |
 | `token_type` | yes | The requested output type. Supported values are `oracle-database`, `oci-service`, `oauth`, and `userid`. |
 | `scope` | depends on flow | Required for `oauth` and `oracle-database`. Not used for `userid` or `oci-service`. |
 | `client_key` | yes | Key into the configured `oauth_apps` map. Required even when the map has one entry. |
@@ -40,6 +40,8 @@ Credentials that refer to OCI signer dictionaries and OCI CLI profile names do n
 | Credential shape | Supported flows | Notes |
 | --- | --- | --- |
 | Incoming assertion string | `oauth`, `userid`, `oracle-database`, `oci-service` | TokenFactory validates this assertion before trusting `sub`, groups, audience, or incoming scopes. |
+| `OCI_PRINCIPAL` | `oracle-database` | TokenFactory uses the configured OCI instance/resource principal to request the database token. `TF_SHARED_OCI_AUTH_MODE` defaults to `instance-principal` and may be set to `resource-principal`. |
+| `PROCESS` | `oracle-database` | Reserved for future RPST process-principal database tokens. The selector currently raises a not-implemented error. |
 | `None` | `oauth` only | TokenFactory requests an application token with the OAuth `client_credentials` grant. There is no end-user assertion to validate and no end-user subject or group authorization context. |
 
 ### Return value
@@ -66,6 +68,7 @@ The table below is a quick handout for clients integrating with the library. It 
 | `token_type` | Accepted credential types | Extra input | Returned token or value | Main upstream dependencies |
 | --- | --- | --- | --- | --- |
 | `oracle-database` | incoming caller assertion string | downstream `scope` required | Oracle Database scoped access token plus session private key as the first two tuple elements | Incoming token validation, optional group-scope authorization, JWT assertion signing, IdentityPropagationTrust, `TokenExchangeSigner`, Identity Data Plane `generate_scoped_access_token` |
+| `oracle-database` | `OCI_PRINCIPAL` | downstream `scope` required | Oracle Database scoped access token plus session private key as the first two tuple elements | Configured OCI instance/resource principal signer, Identity Data Plane `generate_scoped_access_token` |
 | `oci-service` | incoming caller assertion string | no scope | OCI `TokenExchangeSigner` backed by a UPST, not a raw token string | Incoming token validation, JWT assertion signing, IdentityPropagationTrust, `TokenExchangeSigner` |
 | `oauth` | incoming caller assertion string | downstream `scope` required | OAuth access token in the response payload (`issued_token_type=oauth`) | Incoming token validation, optional group-scope authorization, Identity Domain `/oauth2/v1/token` JWT bearer grant |
 | `oauth` | `None` | downstream `scope` required | OAuth access token in the response payload (`issued_token_type=oauth`) | Identity Domain `/oauth2/v1/token` client credentials grant using the selected OAuth app client ID and client secret |
@@ -80,11 +83,27 @@ The table below is a quick handout for clients integrating with the library. It 
 
 Client credentials mode does not involve private-key cryptographic operations. It does not sign JWT assertions, load a private key into a crypto backend, create a UPST signer, or use IdentityPropagationTrust. It only uses the selected OAuth app's client credentials against the Identity Domain token endpoint. If the same `oauth_apps` entry is also used for assertion-backed, `oracle-database`, or `oci-service` flows, that entry may still carry private-key and certificate configuration for those other flows.
 
+#### Oracle Database principal selectors
+
+`token_type="oracle-database"` supports two principal modes through the `credential` argument:
+
+```python
+# User-scoped database token through the existing UPST path.
+factory.get_token("oracle-database", caller_jwt, db_scope, client_key="MCP_SERVER")
+
+# OCI instance/resource principal database token.
+factory.get_token("oracle-database", "OCI_PRINCIPAL", db_scope, client_key="MCP_SERVER")
+```
+
+`OCI_PRINCIPAL` is case-insensitive. It defaults to `TF_SHARED_OCI_AUTH_MODE=instance-principal`; set `TF_SHARED_OCI_AUTH_MODE=resource-principal` for resource-principal runtimes. `TF_SHARED_OCI_AUTH_MODE=oci-profile` is rejected for this database-token path. The reserved selector `PROCESS` is intentionally not implemented yet and is kept for future RPST process-principal support.
+
+Oracle Database results still unpack as `(token, private_key_pem, expires_in, token_type, issued_token_type)`. They also expose `principal_mode` and `expires_at_epoch` attributes for connection-pool lifecycle decisions. Pool keys for OCI-principal database tokens should include the connect target, database token scope, and principal mode, and pools should be retired before `expires_at_epoch`.
+
 ### Validation and common errors
 
 - Unsupported `token_type` values raise `ValueError`.
 - `oauth` and `oracle-database` raise `ValueError` if `scope` is missing.
-- `get_token()` raises `ValueError` if `credential` is not a non-empty caller assertion string, except for the explicit `token_type="oauth"` client credentials mode where `credential=None` is valid.
+- `get_token()` raises `ValueError` if `credential` is not a non-empty caller assertion string, except for the explicit `token_type="oauth"` client credentials mode where `credential=None` is valid and `token_type="oracle-database"` where `credential="OCI_PRINCIPAL"` is valid.
 - `CallerAssertionValidationError` maps to invalid incoming caller assertions.
 - `AuthorizationError` maps to group-scope authorization denial when authorization policy enforcement is enabled.
 - Configuration issues raise `ConfigurationError`.
@@ -159,7 +178,7 @@ For `token_type="oauth"` with `credential=None`, TokenFactory does not run this 
 1. TokenFactory signs a new JWT assertion using the resolved hosting app issuer, private key, and `kid` when the selected flow needs assertion-backed token exchange.
 2. For assertion-backed `oauth`, TokenFactory first returns the incoming token unchanged when it is already valid for the requested OAuth resource audience and already carries the issued scope. Otherwise, it exchanges the assertion at the Identity Domain token endpoint and returns a downstream OAuth access token payload.
 3. For client credentials `oauth`, TokenFactory sends `grant_type=client_credentials` to the Identity Domain token endpoint with the requested scope and returns the OAuth access token payload. This path does not perform private-key signing or any other private-key cryptographic operation.
-4. For `oracle-database`, TokenFactory builds a UPST-backed signer, requests a scoped database token, and returns the database token plus session private key material.
+4. For assertion-backed `oracle-database`, TokenFactory builds a UPST-backed signer, requests a scoped database token, and returns the database token plus session private key material. For `credential="OCI_PRINCIPAL"`, TokenFactory uses the configured OCI instance/resource principal signer directly.
 5. For `oci-service`, TokenFactory returns an OCI `TokenExchangeSigner` backed by the propagated user security token.
 6. For `userid`, TokenFactory returns the trusted subject identifier after credential validation.
 7. The client receives the token-type-specific result without implementing introspection, JWT signature validation, Vault secret loading, assertion signing, IdentityPropagationTrust, authorization, or OCI token exchange logic itself.
@@ -210,13 +229,13 @@ Operational notes:
 - The Vault secret value must be exactly `client_id:client_secret`.
 - For incoming caller assertion validation, configure the app as a resource server and issue caller tokens with an audience that appears in `OAuthClientInfo.resource_audiences`.
 - If `OAuthClientInfo.required_incoming_scopes` is set, the incoming caller assertion must already contain those scopes in `scope` or `scp`.
-- For UPST-backed flows (`oracle-database`, `oci-service`), the selected app client ID must also be listed in the `oauthClients` array of the `IdentityPropagationTrust`.
+- For UPST-backed flows (`oracle-database` with a caller assertion, and `oci-service`), the selected app client ID must also be listed in the `oauthClients` array of the `IdentityPropagationTrust`.
 - If the Identity Domain token endpoint starts returning `400 invalid_scope`, verify that the selected OAuth app owns the requested resource scope and that the caller application is allowed to request it. For resource scopes, the request often uses the fully qualified form such as `https://playground.mcp.server/tools.get_user_info`, while the issued access token may contain only `tools.get_user_info`.
 - If the Identity Domain token endpoint starts returning `400 invalid_request` after scope changes, verify the selected OAuth app grants, certificate alias, and JWT assertion configuration.
 
 **2. IdentityPropagationTrust for UPST (User Principal Service Token) Flows**
 
-`oracle-database` and `oci-service` depend on an IdentityPropagationTrust because TokenFactory signs a JWT assertion for the selected hosting app and exchanges it into a UPST-backed signer.
+`oracle-database` with a caller assertion and `oci-service` depend on an IdentityPropagationTrust because TokenFactory signs a JWT assertion for the selected hosting app and exchanges it into a UPST-backed signer. `oracle-database` with `credential="OCI_PRINCIPAL"` does not use this UPST path.
 
 The trust must be aligned with the module configuration:
 

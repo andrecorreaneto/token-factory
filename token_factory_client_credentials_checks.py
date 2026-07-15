@@ -63,9 +63,32 @@ primitives_module = types.ModuleType("cryptography.hazmat.primitives")
 hashes_module = types.ModuleType("cryptography.hazmat.primitives.hashes")
 serialization_module = types.ModuleType("cryptography.hazmat.primitives.serialization")
 asymmetric_module = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
+rsa_module = types.ModuleType("cryptography.hazmat.primitives.asymmetric.rsa")
+asymmetric_module.rsa = rsa_module
 padding_module = types.ModuleType("cryptography.hazmat.primitives.asymmetric.padding")
 backends_module = types.ModuleType("cryptography.hazmat.backends")
 backends_module.default_backend = lambda: object()
+
+
+class _FakePublicKey:
+    def public_bytes(self, *_args, **_kwargs):
+        return b"-----BEGIN PUBLIC KEY-----\npublic\n-----END PUBLIC KEY-----\n"
+
+
+class _FakePrivateKey:
+    def public_key(self):
+        return _FakePublicKey()
+
+    def private_bytes(self, *_args, **_kwargs):
+        return b"-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----\n"
+
+
+rsa_module.generate_private_key = lambda *_args, **_kwargs: _FakePrivateKey()
+serialization_module.Encoding = types.SimpleNamespace(PEM="PEM")
+serialization_module.PublicFormat = types.SimpleNamespace(SubjectPublicKeyInfo="SubjectPublicKeyInfo")
+serialization_module.PrivateFormat = types.SimpleNamespace(TraditionalOpenSSL="TraditionalOpenSSL")
+serialization_module.NoEncryption = lambda: object()
+serialization_module.load_pem_private_key = lambda *_args, **_kwargs: _FakePrivateKey()
 sys.modules.setdefault("cryptography", cryptography_module)
 sys.modules.setdefault("cryptography.x509", cryptography_module.x509)
 sys.modules.setdefault("cryptography.exceptions", cryptography_exceptions_module)
@@ -74,6 +97,7 @@ sys.modules.setdefault("cryptography.hazmat.primitives", primitives_module)
 sys.modules.setdefault("cryptography.hazmat.primitives.hashes", hashes_module)
 sys.modules.setdefault("cryptography.hazmat.primitives.serialization", serialization_module)
 sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric", asymmetric_module)
+sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric.rsa", rsa_module)
 sys.modules.setdefault("cryptography.hazmat.primitives.asymmetric.padding", padding_module)
 sys.modules.setdefault("cryptography.hazmat.backends", backends_module)
 

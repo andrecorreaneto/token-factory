@@ -31,7 +31,15 @@ from ._token_validation import (
     TrustedTokenValidator,
     ValidatedCallerAssertion,
 )
-from .factory import ConfigurationError, TokenExchangeError, TokenFactory, TokenFactoryConfig
+from .factory import (
+    ConfigurationError,
+    ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL,
+    ORACLE_DATABASE_CREDENTIAL_PROCESS,
+    OracleDatabaseTokenResult,
+    TokenExchangeError,
+    TokenFactory,
+    TokenFactoryConfig,
+)
 
 __all__ = [
     "AuthorizationError",
@@ -50,6 +58,9 @@ __all__ = [
     "OAuthClientInfo",
     "OAuthClientResolutionError",
     "OAuthClientResolver",
+    "ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL",
+    "ORACLE_DATABASE_CREDENTIAL_PROCESS",
+    "OracleDatabaseTokenResult",
     "ResolvedHostingComponent",
     "SignedVaultAuthorizationPolicyProvider",
     "StaticAuthorizationPolicyProvider",

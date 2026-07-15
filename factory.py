@@ -9,6 +9,7 @@ import jwt
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
 from oci.auth.signers import TokenExchangeSigner
 
 from ._authorization import (
@@ -32,6 +33,7 @@ from ._factory_support import (
     _extract_token_exchange_signer_keypair_pem,
     _fetch_secret_value_from_oci,
     _generate_db_token_with_dataplane,
+    _get_factory_oci_signer,
     build_oci_request_signer,
     build_signer_credential_from_profile,
 )
@@ -46,7 +48,40 @@ from ._runtime_config import TokenFactoryRuntimeConfig
 from ._token_validation import HybridTokenValidator
 
 
-Credential = Union[str, Dict[str, Any]]
+Credential = Optional[Union[str, Dict[str, Any]]]
+ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL = "OCI_PRINCIPAL"
+ORACLE_DATABASE_CREDENTIAL_PROCESS = "PROCESS"
+_ORACLE_DATABASE_CREDENTIAL_SELECTORS = {
+    ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL,
+    ORACLE_DATABASE_CREDENTIAL_PROCESS,
+}
+
+
+class OracleDatabaseTokenResult(tuple):
+    def __new__(
+        cls,
+        db_token: str,
+        private_key_pem: str,
+        expires_in: int,
+        token_type: str,
+        issued_token_type: str,
+        *,
+        principal_mode: str,
+        expires_at_epoch: int,
+    ):
+        value = tuple.__new__(
+            cls,
+            (db_token, private_key_pem, expires_in, token_type, issued_token_type),
+        )
+        value.token = db_token
+        value.db_token = db_token
+        value.private_key_pem = private_key_pem
+        value.expires_in = expires_in
+        value.token_type = token_type
+        value.issued_token_type = issued_token_type
+        value.principal_mode = principal_mode
+        value.expires_at_epoch = expires_at_epoch
+        return value
 
 
 class TokenFactory:
@@ -64,6 +99,7 @@ class TokenFactory:
         token_exchange_signer_cls: Any = TokenExchangeSigner,
         signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem,
         db_token_generator: Any = _generate_db_token_with_dataplane,
+        factory_oci_signer_builder: Any = _get_factory_oci_signer,
         oci_signer_builder: Any = build_oci_request_signer,
     ):
         if config is not None and config_or_overrides is not None:
@@ -99,6 +135,7 @@ class TokenFactory:
         self._token_exchange_signer_cls = token_exchange_signer_cls
         self._signer_keypair_extractor = signer_keypair_extractor
         self._db_token_generator = db_token_generator
+        self._factory_oci_signer_builder = factory_oci_signer_builder
         self._oci_signer_builder = oci_signer_builder
 
     @classmethod
@@ -113,6 +150,7 @@ class TokenFactory:
         *,
         client_key: Optional[str] = None,
     ) -> Any:
+        credential, token_type = _normalize_get_token_arguments(credential, token_type)
         if token_type not in SUPPORTED_TOKEN_TYPES:
             supported = ", ".join(SUPPORTED_TOKEN_TYPES)
             raise ValueError(
@@ -127,6 +165,18 @@ class TokenFactory:
                 scope,
                 hosting_component,
             )
+        if token_type == "oracle-database":
+            if not scope:
+                raise ValueError(f"Scope is required for token_type '{token_type}'")
+            selector = _oracle_database_credential_selector(credential)
+            if selector == ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL:
+                _require_oci_principal_database_auth_mode(self._runtime_config)
+                return self._exchange_oracle_database_token_with_oci_principal(scope)
+            if selector == ORACLE_DATABASE_CREDENTIAL_PROCESS:
+                raise NotImplementedError(
+                    "oracle-database credential selector 'PROCESS' is reserved for "
+                    "future RPST process-principal support and is not implemented yet."
+                )
         if not isinstance(credential, str) or not credential:
             raise ValueError(
                 f"token_type '{token_type}' requires credential to be a non-empty caller assertion string."
@@ -324,7 +374,7 @@ class TokenFactory:
         subject: str,
         hosting_component: ResolvedHostingComponent,
         scope: str,
-    ) -> Tuple[str, str, int, str, str]:
+    ) -> OracleDatabaseTokenResult:
         assertion = self._build_jwt_assertion(subject, hosting_component, "oracle-database")
         signer = self._build_upst_signer(assertion, hosting_component)
         public_key_pem, private_key_pem = self._signer_keypair_extractor(signer)
@@ -334,12 +384,28 @@ class TokenFactory:
             scope,
             self._runtime_config,
         )
-        return (
+        return _oracle_database_token_result(
             db_token,
             private_key_pem,
-            _expires_in(db_token),
-            "Bearer",
-            "oracle-database",
+            principal_mode="user",
+        )
+
+    def _exchange_oracle_database_token_with_oci_principal(
+        self,
+        scope: str,
+    ) -> OracleDatabaseTokenResult:
+        signer = self._factory_oci_signer_builder(self._runtime_config)
+        public_key_pem, private_key_pem = _generate_database_session_keypair_pem()
+        db_token = self._db_token_generator(
+            signer,
+            public_key_pem,
+            scope,
+            self._runtime_config,
+        )
+        return _oracle_database_token_result(
+            db_token,
+            private_key_pem,
+            principal_mode="oci_principal",
         )
 
     def _build_upst_signer(
@@ -433,6 +499,69 @@ def _require_client_key(client_key: Optional[str]) -> str:
     if not stripped:
         raise OAuthClientResolutionError("client_key is required.")
     return stripped
+
+
+def _normalize_get_token_arguments(
+    credential: Credential,
+    token_type: str,
+) -> Tuple[Credential, str]:
+    if isinstance(credential, str) and credential in SUPPORTED_TOKEN_TYPES:
+        if not isinstance(token_type, str) or token_type not in SUPPORTED_TOKEN_TYPES:
+            return token_type, credential
+    return credential, token_type
+
+
+def _oracle_database_credential_selector(credential: Credential) -> Optional[str]:
+    if not isinstance(credential, str):
+        return None
+    normalized = credential.strip().upper()
+    if normalized in _ORACLE_DATABASE_CREDENTIAL_SELECTORS:
+        return normalized
+    return None
+
+
+def _require_oci_principal_database_auth_mode(
+    runtime_config: TokenFactoryRuntimeConfig,
+) -> None:
+    oci_auth_mode = str(runtime_config.oci_auth_mode or "").strip().lower()
+    if oci_auth_mode in {"", "instance-principal", "resource-principal"}:
+        return
+    raise ConfigurationError(
+        "oracle-database credential selector 'OCI_PRINCIPAL' supports only "
+        "TF_SHARED_OCI_AUTH_MODE=instance-principal or resource-principal."
+    )
+
+
+def _generate_database_session_keypair_pem() -> Tuple[str, str]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    return public_key_pem, private_key_pem
+
+
+def _oracle_database_token_result(
+    db_token: str,
+    private_key_pem: str,
+    *,
+    principal_mode: str,
+) -> OracleDatabaseTokenResult:
+    expires_at_epoch = _expires_at_epoch(db_token)
+    return OracleDatabaseTokenResult(
+        db_token,
+        private_key_pem,
+        max(expires_at_epoch - int(time.time()), 0),
+        "Bearer",
+        "oracle-database",
+        principal_mode=principal_mode,
+        expires_at_epoch=expires_at_epoch,
+    )
 
 
 def _default_policy_provider(
@@ -641,15 +770,25 @@ def _load_private_key(private_key_pem: str, passphrase: Optional[str]):
 
 
 def _expires_in(token: str) -> int:
+    return max(_expires_at_epoch(token) - int(time.time()), 0)
+
+
+def _expires_at_epoch(token: str) -> int:
     try:
         payload = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
-        return max(payload.get("exp", 0) - int(time.time()), 0)
+        expires_at = int(payload.get("exp", 0))
+        if expires_at > 0:
+            return expires_at
     except Exception:
-        return 3600
+        pass
+    return int(time.time()) + 3600
 
 
 __all__ = [
     "ConfigurationError",
+    "ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL",
+    "ORACLE_DATABASE_CREDENTIAL_PROCESS",
+    "OracleDatabaseTokenResult",
     "TokenExchangeError",
     "TokenFactoryConfig",
     "TokenFactory",
