@@ -3,6 +3,11 @@ resource "terraform_data" "validate_inputs" {
 
   lifecycle {
     precondition {
+      condition     = length(local.selected_identity_domain_matches) == 1
+      error_message = "VALIDATION FAILURE: identity_domain_url must resolve to exactly one OCI Identity Domain."
+    }
+
+    precondition {
       condition = !(
         (var.enable_oci_secrets || length(var.oauth_apps) > 0) &&
         var.oci_secrets_compartment_ocid == null

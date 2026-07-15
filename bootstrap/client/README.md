@@ -29,6 +29,11 @@ oauth_apps = {
       resource_ocid    = "ocid1.instance.oc1..compute"
       oci_auth_profile = null
       oci_region       = null
+
+      database_access = {
+        target_database_compartment_ocid = "ocid1.compartment.oc1..database"
+        target_database_ocid             = "ocid1.autonomousdatabase.oc1..database"
+      }
     }
 
     enable_identity_propagation_trust = true
@@ -51,6 +56,7 @@ oauth_apps = {
 
 `TF_SHARED_OCI_AUTH_MODE` is derived by the root module from `runtime.principal_type`.
 `resource_scopes` defines incoming resource-server scopes and makes the Identity Domain app an OAuth resource when non-empty. `allowed_scopes` defines OAuth client authorized scopes and must contain Identity Domain FQS strings. `app_roles` controls Identity Domain app-role grants and defaults to no grants.
+Set `runtime.database_access` only when the runtime dynamic group should be allowed to request Oracle Database `db-token`s for TokenFactory `credential="OCI_PRINCIPAL"` calls.
 
 ## Outputs
 
@@ -58,11 +64,10 @@ The wrapper exposes a concise client-facing surface:
 
 | Output | Purpose |
 | --- | --- |
-| `runtime_shared_env` | Shared shell `export` lines for `TF_SHARED_*` runtime config. Use this when the hosting runtime is configured through environment variables. |
-| `runtime_clients_env` | Shell `export` lines for `TF_CLIENT_*` OAuth client config by OAuth app key. Contains secret OCID references, not inline secrets. |
-| `sensitive_runtime_clients_env` | Sensitive shell `export` lines for `TF_CLIENT_*` OAuth client config, including inline credentials and PEM values when `enable_oci_secrets = false`. |
-| `runtime_shared` | Shared `TokenFactoryRuntimeConfig` constructor-shaped config. Use `TokenFactoryRuntimeConfig(**runtime_config)`. |
-| `runtime_clients` | Non-sensitive `OAuthClientInfo`-shaped resolver config by OAuth app key. Use `OAuthClientInfo(**oauth_apps["MCP_SERVER"])`. |
-| `provisioned_resources` | Names and OCIDs of shared resources, OAuth apps, runtime principals, policies, and secrets for lookup. Null unless `output_provisioned_resources = true`. |
+| `shared_runtime_config` | Shared Token Factory runtime config object. |
+| `shared_runtime_config_exports` | Shell `export` lines derived from `shared_runtime_config`. |
+| `clients_runtime_config` | Per-client non-sensitive OAuth resolver config with secret OCID references and optional database setup commands. |
+| `clients_runtime_config_exports` | Per-client shell `export` lines derived from `clients_runtime_config[*].oauth_client_config`. |
+| `provisioned_resources` | Names, OCIDs/IDs, policy statements, and selected Identity Domain metadata. |
 
-Use shared `runtime_config` plus `oauth_apps[<client_key>]` for normal constructor-based deployments. Use shared `runtime_config_env` plus `client_config_envs[<client_key>]` when the hosting runtime is configured through environment variables. Set `output_provisioned_resources = true` only when you want the lookup-friendly resource names and OCIDs output.
+Use `shared_runtime_config` plus `clients_runtime_config[<client_key>]` for normal deployments. Use `shared_runtime_config_exports` and `clients_runtime_config_exports[<client_key>]` when the hosting runtime is configured through shell environment variables.

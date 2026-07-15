@@ -7,6 +7,33 @@ data "oci_identity_tenancy" "this" {
 locals {
   provider_region = coalesce(var.region, var.identity_domain_region)
 
+  normalized_identity_domain_url              = lower(trimsuffix(var.identity_domain_url, "/"))
+  normalized_identity_domain_url_without_port = replace(local.normalized_identity_domain_url, "/:443$/", "")
+  selected_identity_domain_matches = [
+    for domain in data.oci_identity_domains.selected.domains :
+    domain
+    if contains([
+      lower(trimsuffix(domain.url, "/")),
+      replace(lower(trimsuffix(domain.url, "/")), "/:443$/", ""),
+      lower(trimsuffix(domain.home_region_url, "/")),
+      replace(lower(trimsuffix(domain.home_region_url, "/")), "/:443$/", ""),
+      ], local.normalized_identity_domain_url) || contains([
+      lower(trimsuffix(domain.url, "/")),
+      replace(lower(trimsuffix(domain.url, "/")), "/:443$/", ""),
+      lower(trimsuffix(domain.home_region_url, "/")),
+      replace(lower(trimsuffix(domain.home_region_url, "/")), "/:443$/", ""),
+    ], local.normalized_identity_domain_url_without_port)
+  ]
+  selected_identity_domain      = try(local.selected_identity_domain_matches[0], null)
+  selected_identity_domain_name = try(local.selected_identity_domain.display_name, "")
+  selected_identity_domain_type = lower(try(local.selected_identity_domain.type, ""))
+  selected_identity_domain_url  = trimsuffix(try(local.selected_identity_domain.url, ""), "/")
+  selected_identity_domain_id   = try(local.selected_identity_domain.id, null)
+  selected_identity_domain_is_default = (
+    contains(["default", "default_domain", "defaultdomain"], replace(local.selected_identity_domain_type, "-", "_")) ||
+    lower(local.selected_identity_domain_name) == "default"
+  )
+
   regions_map         = { for r in data.oci_identity_regions.these.regions : r.key => r.name }
   regions_map_reverse = { for r in data.oci_identity_regions.these.regions : r.name => r.key }
   home_region_key     = data.oci_identity_tenancy.this.home_region_key
@@ -71,9 +98,10 @@ locals {
         private_key            = "${local.normalized_oauth_app_resource_names[key]}-jwt-private-key-secret"
         private_key_passphrase = "${local.normalized_oauth_app_resource_names[key]}-jwt-private-key-passphrase-secret"
         certificate            = "${local.normalized_oauth_app_resource_names[key]}-jwt-certificate-secret"
-        dynamic_group          = "${local.normalized_oauth_app_resource_names[key]}-runtime-dynamic-group"
-        user_group             = "${local.normalized_oauth_app_resource_names[key]}-runtime-user-group"
+        dynamic_group          = "${local.normalized_oauth_app_resource_names[key]}-dynamic-group"
+        user_group             = "${local.normalized_oauth_app_resource_names[key]}-user-group"
         policy                 = "${local.normalized_oauth_app_resource_names[key]}-secrets-policy"
+        database_access_policy = "${local.normalized_oauth_app_resource_names[key]}-database-access-policy"
       }
     }
   }
@@ -93,6 +121,7 @@ locals {
         dynamic_group          = "Token Factory runtime identity for ${key}."
         user_group             = "Token Factory API-key runtime identity for ${key}."
         policy                 = "Token Factory Vault secret read access for ${key}."
+        database_access_policy = "Token Factory database connectivity access for ${key}."
       }
     }
   }
@@ -178,11 +207,16 @@ locals {
     key => component
     if component.runtime.principal_type != "user-group"
   }
+  default_dynamic_group_components = local.selected_identity_domain_is_default ? local.dynamic_group_components : {}
+  custom_dynamic_group_components  = local.selected_identity_domain_is_default ? {} : local.dynamic_group_components
+
   user_group_components = {
     for key, component in var.oauth_apps :
     key => component
     if component.runtime.principal_type == "user-group"
   }
+  default_user_group_components = local.selected_identity_domain_is_default ? local.user_group_components : {}
+  custom_user_group_components  = local.selected_identity_domain_is_default ? {} : local.user_group_components
 
   runtime_resource_types = {
     for key, component in var.oauth_apps :
@@ -204,15 +238,31 @@ locals {
 
   runtime_principal_names = {
     for key, component in var.oauth_apps :
-    key => component.runtime.principal_type == "user-group" ? oci_identity_group.these[key].name : oci_identity_dynamic_group.these[key].name
+    key => component.runtime.principal_type == "user-group" ? (
+      local.selected_identity_domain_is_default ? oci_identity_group.these[key].name : oci_identity_domains_group.these[key].display_name
+      ) : (
+      local.selected_identity_domain_is_default ? oci_identity_dynamic_group.these[key].name : oci_identity_domains_dynamic_resource_group.these[key].display_name
+    )
   }
   runtime_principal_ids = {
     for key, component in var.oauth_apps :
-    key => component.runtime.principal_type == "user-group" ? oci_identity_group.these[key].id : oci_identity_dynamic_group.these[key].id
+    key => component.runtime.principal_type == "user-group" ? (
+      local.selected_identity_domain_is_default ? oci_identity_group.these[key].id : coalesce(oci_identity_domains_group.these[key].ocid, oci_identity_domains_group.these[key].id)
+      ) : (
+      local.selected_identity_domain_is_default ? oci_identity_dynamic_group.these[key].id : coalesce(oci_identity_domains_dynamic_resource_group.these[key].ocid, oci_identity_domains_dynamic_resource_group.these[key].id)
+    )
   }
   runtime_principal_kinds = {
     for key, component in var.oauth_apps :
     key => component.runtime.principal_type == "user-group" ? "group" : "dynamic-group"
+  }
+  runtime_principal_subject_names = {
+    for key, component in var.oauth_apps :
+    key => local.selected_identity_domain_is_default ? local.runtime_principal_names[key] : "'${local.selected_identity_domain_name}'/'${local.runtime_principal_names[key]}'"
+  }
+  runtime_principal_subjects = {
+    for key, component in var.oauth_apps :
+    key => "${local.runtime_principal_kinds[key]} ${local.runtime_principal_subject_names[key]}"
   }
 
   oauth_app_runtime_secret_ocids = {
@@ -235,19 +285,41 @@ locals {
   base_secret_policy_statements = {
     for key, component in var.oauth_apps :
     key => [
-      "allow ${local.runtime_principal_kinds[key]} ${local.runtime_principal_names[key]} to read secret-bundles in compartment id ${var.oci_secrets_compartment_ocid}"
+      "allow ${local.runtime_principal_subjects[key]} to read secret-bundles in compartment id ${var.oci_secrets_compartment_ocid}"
     ]
   }
   restricted_secret_policy_statements = {
     for key, component in var.oauth_apps :
     key => [
       for secret_ocid in local.runtime_secret_ocids[key] :
-      "allow ${local.runtime_principal_kinds[key]} ${local.runtime_principal_names[key]} to read secret-bundles in compartment id ${var.oci_secrets_compartment_ocid} where target.secret.id = '${secret_ocid}'"
+      "allow ${local.runtime_principal_subjects[key]} to read secret-bundles in compartment id ${var.oci_secrets_compartment_ocid} where target.secret.id = '${secret_ocid}'"
     ]
   }
   secret_policy_statements = {
     for key, component in var.oauth_apps :
     key => var.restrict_secret_policy_to_secret_ocids ? local.restricted_secret_policy_statements[key] : local.base_secret_policy_statements[key]
+  }
+  database_access_components = {
+    for key, component in var.oauth_apps :
+    key => component
+    if component.runtime.database_access != null
+  }
+  database_access_policy_statements = {
+    for key, component in local.database_access_components :
+    key => [
+      "allow ${local.runtime_principal_subjects[key]} to use database-connections in compartment id ${component.runtime.database_access.target_database_compartment_ocid} where target.database.id = '${component.runtime.database_access.target_database_ocid}'"
+    ]
+  }
+  database_access_db_user_names = {
+    for key, component in local.database_access_components :
+    key => upper(replace(local.runtime_principal_names[key], "/[^0-9A-Za-z]+/", "_"))
+  }
+  database_access_requirement_commands = {
+    for key, component in local.database_access_components :
+    key => [
+      "CREATE USER ${local.database_access_db_user_names[key]} IDENTIFIED GLOBALLY AS 'IAM_GROUP_NAME=${local.selected_identity_domain_name}/${local.runtime_principal_names[key]}';",
+      "GRANT CREATE SESSION TO ${local.database_access_db_user_names[key]};",
+    ]
   }
 
   token_factory_shared_runtime_config = {
@@ -263,6 +335,21 @@ locals {
       TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON  = length(var.token_factory_authz_policy_trusted_signers) == 0 ? null : jsonencode(var.token_factory_authz_policy_trusted_signers)
       TF_SHARED_AUTHZ_POLICY_ENVIRONMENT    = var.token_factory_authz_policy_environment
       TF_SHARED_AUTHZ_POLICY_TENANT_ID      = var.emit_authz_policy_tenant_id ? var.tenancy_ocid : null
+    } : key => value if value != null
+  }
+  shared_runtime_config = {
+    for key, value in {
+      domain_url                  = var.identity_domain_url
+      domain_region               = var.identity_domain_region
+      timeout_seconds             = var.token_factory_timeout_seconds
+      subject_claim               = var.token_factory_subject_claim
+      groups_claim                = var.token_factory_groups_claim
+      log_full_assertion          = var.token_factory_log_full_assertion
+      authz_policy_secret_ocid    = var.token_factory_authz_policy_secret_ocid
+      authz_policy_signature_mode = var.token_factory_authz_policy_signature_mode
+      authz_trusted_signers       = length(var.token_factory_authz_policy_trusted_signers) == 0 ? null : var.token_factory_authz_policy_trusted_signers
+      authz_policy_environment    = var.token_factory_authz_policy_environment
+      authz_policy_tenant_id      = var.emit_authz_policy_tenant_id ? var.tenancy_ocid : null
     } : key => value if value != null
   }
 
@@ -363,6 +450,7 @@ locals {
       principal_kind = local.runtime_principal_kinds[key]
       name           = local.runtime_principal_names[key]
       id             = local.runtime_principal_ids[key]
+      subject        = local.runtime_principal_subjects[key]
       matching_rule  = component.runtime.principal_type == "user-group" ? null : local.runtime_matching_rules[key]
     }
   }

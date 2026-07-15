@@ -179,6 +179,10 @@ variable "oauth_apps" {
       resource_ocid    = optional(string, null)
       oci_auth_profile = optional(string, null)
       oci_region       = optional(string, null)
+      database_access = optional(object({
+        target_database_compartment_ocid = string
+        target_database_ocid             = string
+      }), null)
     })
 
     enable_identity_propagation_trust = optional(bool, true)
@@ -245,6 +249,33 @@ variable "oauth_apps" {
   }
 
   validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.runtime.database_access == null ||
+      component.runtime.principal_type != "user-group"
+    ])
+    error_message = "oauth_apps[*].runtime.database_access requires a dynamic-group runtime; user-group runtimes are not supported."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.runtime.database_access == null ||
+      trimspace(component.runtime.database_access.target_database_compartment_ocid) != ""
+    ])
+    error_message = "oauth_apps[*].runtime.database_access.target_database_compartment_ocid must not be empty."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.runtime.database_access == null ||
+      trimspace(component.runtime.database_access.target_database_ocid) != ""
+    ])
+    error_message = "oauth_apps[*].runtime.database_access.target_database_ocid must not be empty."
+  }
+
+  validation {
     condition = alltrue(flatten([
       for component in var.oauth_apps : [
         for scope in component.allowed_scopes :
@@ -293,4 +324,10 @@ variable "oauth_apps" {
     ])
     error_message = "oauth_apps[*].app_roles must contain unique supported Identity Domain app role display names."
   }
+}
+
+variable "output_provisioned_resources" {
+  description = "When true, outputs provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database setup commands."
+  type        = bool
+  default     = false
 }

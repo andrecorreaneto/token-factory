@@ -86,12 +86,6 @@ variable "restrict_secret_policy_to_secret_ocids" {
   default     = false
 }
 
-variable "output_provisioned_resources" {
-  description = "When true, output names and OCIDs for provisioned shared and OAuth app/runtime resources."
-  type        = bool
-  default     = false
-}
-
 variable "token_factory_timeout_seconds" {
   description = "TokenFactory HTTP timeout in seconds."
   type        = number
@@ -185,6 +179,10 @@ variable "oauth_apps" {
       resource_ocid    = optional(string, null)
       oci_auth_profile = optional(string, null)
       oci_region       = optional(string, null)
+      database_access = optional(object({
+        target_database_compartment_ocid = string
+        target_database_ocid             = string
+      }), null)
     })
 
     enable_identity_propagation_trust = optional(bool, true)
@@ -258,6 +256,33 @@ variable "oauth_apps" {
       ]
     ]))
     error_message = "oauth_apps[*].allowed_scopes values must not be empty."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.runtime.database_access == null ||
+      component.runtime.principal_type != "user-group"
+    ])
+    error_message = "oauth_apps[*].runtime.database_access requires a dynamic-group runtime; user-group runtimes are not supported."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.runtime.database_access == null ||
+      trimspace(component.runtime.database_access.target_database_compartment_ocid) != ""
+    ])
+    error_message = "oauth_apps[*].runtime.database_access.target_database_compartment_ocid must not be empty."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.runtime.database_access == null ||
+      trimspace(component.runtime.database_access.target_database_ocid) != ""
+    ])
+    error_message = "oauth_apps[*].runtime.database_access.target_database_ocid must not be empty."
   }
 
   validation {

@@ -12,7 +12,6 @@ resource_name_prefix   = "token-factory"
 enable_oci_secrets                     = true
 oci_secrets_compartment_ocid           = "ocid1.compartment.oc1..replace-with-secrets-compartment-ocid"
 restrict_secret_policy_to_secret_ocids = true
-output_provisioned_resources           = false
 
 # Optional existing Vault/key. Omit both to create shared Vault storage.
 # oci_vault_existing_ocid      = "ocid1.vault.oc1..replace-with-vault"
@@ -55,6 +54,13 @@ oauth_apps = {
       resource_ocid    = "ocid1.instance.oc1..replace-with-compute-instance-ocid"
       oci_auth_profile = null
       oci_region       = null
+
+      # Optional. Enable only when this runtime should request Oracle Database
+      # db-tokens with TokenFactory credential="OCI_PRINCIPAL".
+      database_access = {
+        target_database_compartment_ocid = "ocid1.compartment.oc1..replace-with-database-compartment-ocid"
+        target_database_ocid             = "ocid1.autonomousdatabase.oc1..replace-with-database-ocid"
+      }
     }
 
     enable_identity_propagation_trust = true

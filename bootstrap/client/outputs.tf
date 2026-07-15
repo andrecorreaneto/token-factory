@@ -1,47 +1,60 @@
-output "runtime_shared_env" {
-  description = "Shared shell export lines for TokenFactory runtime configuration."
+output "shared_runtime_config" {
+  description = "Shared Token Factory runtime configuration base."
+  value       = module.token_factory_bootstrap.shared_runtime_config
+}
+
+output "shared_runtime_config_exports" {
+  description = "Shell export lines for shared Token Factory runtime configuration."
   value = join("\n", [
-    for key, value in module.token_factory_bootstrap.token_factory_shared_runtime_config :
+    for key, value in {
+      TF_SHARED_DOMAIN_URL                  = module.token_factory_bootstrap.shared_runtime_config.domain_url
+      TF_SHARED_DOMAIN_REGION               = module.token_factory_bootstrap.shared_runtime_config.domain_region
+      TF_SHARED_TIMEOUT_SECONDS             = module.token_factory_bootstrap.shared_runtime_config.timeout_seconds
+      TF_SHARED_SUBJECT_CLAIM               = module.token_factory_bootstrap.shared_runtime_config.subject_claim
+      TF_SHARED_GROUPS_CLAIM                = module.token_factory_bootstrap.shared_runtime_config.groups_claim
+      TF_SHARED_LOG_FULL_ASSERTION          = module.token_factory_bootstrap.shared_runtime_config.log_full_assertion
+      TF_SHARED_AUTHZ_POLICY_SECRET_OCID    = try(module.token_factory_bootstrap.shared_runtime_config.authz_policy_secret_ocid, null)
+      TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE = module.token_factory_bootstrap.shared_runtime_config.authz_policy_signature_mode
+      TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON  = try(jsonencode(module.token_factory_bootstrap.shared_runtime_config.authz_trusted_signers), null)
+      TF_SHARED_AUTHZ_POLICY_ENVIRONMENT    = try(module.token_factory_bootstrap.shared_runtime_config.authz_policy_environment, null)
+      TF_SHARED_AUTHZ_POLICY_TENANT_ID      = try(module.token_factory_bootstrap.shared_runtime_config.authz_policy_tenant_id, null)
+    } :
     "export ${key}=${jsonencode(tostring(value))}"
+    if value != null
   ])
 }
 
-output "runtime_shared" {
-  description = "Shared TokenFactoryRuntimeConfig constructor-shaped runtime config."
+output "clients_runtime_config" {
+  description = "Token Factory per-client runtime and OAuth resolver configuration."
+  value       = module.token_factory_bootstrap.clients_runtime_config
+}
+
+output "clients_runtime_config_exports" {
+  description = "Shell export lines for Token Factory per-client OAuth resolver configuration."
   value = {
-    for config_key, config_value in {
-      domain_url                  = trimsuffix(var.identity_domain_url, "/")
-      domain_region               = var.identity_domain_region
-      timeout_seconds             = var.token_factory_timeout_seconds
-      subject_claim               = var.token_factory_subject_claim
-      groups_claim                = var.token_factory_groups_claim
-      authz_policy_secret_ocid    = var.token_factory_authz_policy_secret_ocid
-      authz_policy_signature_mode = var.token_factory_authz_policy_signature_mode
-      authz_trusted_signers       = length(var.token_factory_authz_policy_trusted_signers) == 0 ? null : var.token_factory_authz_policy_trusted_signers
-      authz_policy_environment    = var.token_factory_authz_policy_environment
-      authz_policy_tenant_id      = var.emit_authz_policy_tenant_id ? var.tenancy_ocid : null
-      log_full_assertion          = var.token_factory_log_full_assertion
-    } : config_key => config_value if config_value != null
+    for client_key, config in module.token_factory_bootstrap.clients_runtime_config :
+    client_key => join("\n", [
+      for key, value in {
+        TF_CLIENT_KEY                                = client_key
+        TF_CLIENT_CREDS_SECRET_OCID                  = lookup(config.oauth_client_config, "client_credentials_secret_ocid", null)
+        TF_CLIENT_ISSUER                             = lookup(config.oauth_client_config, "issuer", null)
+        TF_CLIENT_PRIVATE_KEY_PATH                   = lookup(config.oauth_client_config, "private_key_path", null)
+        TF_CLIENT_PRIVATE_KEY_SECRET_OCID            = lookup(config.oauth_client_config, "private_key_secret_ocid", null)
+        TF_CLIENT_PRIVATE_KEY_PASSPHRASE_SECRET_OCID = lookup(config.oauth_client_config, "private_key_passphrase_secret_ocid", null)
+        TF_CLIENT_CERT_PATH                          = lookup(config.oauth_client_config, "certificate_path", null)
+        TF_CLIENT_CERT_SECRET_OCID                   = lookup(config.oauth_client_config, "certificate_secret_ocid", null)
+        TF_CLIENT_KID                                = lookup(config.oauth_client_config, "kid", null)
+        TF_CLIENT_RESOURCE_AUDIENCES                 = join(",", lookup(config.oauth_client_config, "resource_audiences", []))
+        TF_CLIENT_REQUIRED_INCOMING_SCOPES           = length(lookup(config.oauth_client_config, "required_incoming_scopes", [])) == 0 ? null : join(",", lookup(config.oauth_client_config, "required_incoming_scopes", []))
+        TF_CLIENT_PROPAGATION_TRUST_CLAIM            = lookup(config.oauth_client_config, "propagation_trust_claim", null)
+      } :
+      "export ${key}=${jsonencode(tostring(value))}"
+      if value != null
+    ])
   }
 }
 
-output "runtime_clients_env" {
-  description = "Shell export lines for Token Factory OAuth client configuration by OAuth app key. Contains TF_CLIENT_* values with secret OCID references, not inline secrets."
-  value       = module.token_factory_bootstrap.token_factory_client_config_env
-}
-
-output "runtime_clients" {
-  description = "Non-sensitive OAuthClientInfo-shaped resolver config by OAuth app key."
-  value       = module.token_factory_bootstrap.oauth_app_configs
-}
-
-output "sensitive_runtime_client_envs" {
-  description = "Sensitive shell export lines for Token Factory OAuth client configuration by OAuth app key, including inline credentials and PEM values when enable_oci_secrets = false."
-  value       = module.token_factory_bootstrap.token_factory_client_sensitive_config_env
-  sensitive   = true
-}
-
 output "provisioned_resources" {
-  description = "Provisioned shared and OAuth app/runtime resources with names and OCIDs for lookup. Null unless output_provisioned_resources is true."
-  value       = var.output_provisioned_resources ? module.token_factory_bootstrap.provisioned_resources : null
+  description = "Provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database setup commands."
+  value       = module.token_factory_bootstrap.provisioned_resources
 }

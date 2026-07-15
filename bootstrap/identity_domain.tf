@@ -1,3 +1,8 @@
+data "oci_identity_domains" "selected" {
+  provider       = oci.home
+  compartment_id = var.tenancy_ocid
+}
+
 resource "oci_identity_domains_oauth_partner_certificate" "these" {
   provider = oci.home
   for_each = var.oauth_apps
@@ -89,6 +94,26 @@ resource "oci_identity_domains_grant" "these" {
     type  = "App"
     value = oci_identity_domains_app.these[each.value.app_key].id
   }
+}
+
+resource "oci_identity_domains_dynamic_resource_group" "these" {
+  provider = oci.home
+  for_each = local.custom_dynamic_group_components
+
+  description   = local.descriptions.oauth_apps[each.key].dynamic_group
+  display_name  = local.names.oauth_apps[each.key].dynamic_group
+  idcs_endpoint = var.identity_domain_url
+  matching_rule = local.runtime_matching_rules[each.key]
+  schemas       = ["urn:ietf:params:scim:schemas:oracle:idcs:DynamicResourceGroup"]
+}
+
+resource "oci_identity_domains_group" "these" {
+  provider = oci.home
+  for_each = local.custom_user_group_components
+
+  display_name  = local.names.oauth_apps[each.key].user_group
+  idcs_endpoint = var.identity_domain_url
+  schemas       = ["urn:ietf:params:scim:schemas:core:2.0:Group"]
 }
 
 resource "oci_identity_domains_identity_propagation_trust" "these" {

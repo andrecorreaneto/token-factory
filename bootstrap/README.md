@@ -12,9 +12,10 @@ This module manages:
 - Optional IdentityPropagationTrust resources.
 - Optional generated JWT private keys and self-signed certificates.
 - Optional OCI Vault, master key, and secrets.
-- Runtime IAM principals: dynamic groups or user groups.
+- Runtime IAM principals: dynamic groups or user groups in the Default domain, or Identity Domain groups/dynamic resource groups in a custom domain.
 - IAM policies granting `read secret-bundle` to runtime principals.
-- `TF_SHARED_*`, `TF_CLIENT_*`, OAuth client resolver config, and resource OCID outputs.
+- Optional IAM policies granting database connectivity access to runtime dynamic groups.
+- Shared runtime config, per-client runtime config, and resource lookup outputs.
 
 ## Mental Model
 
@@ -36,13 +37,13 @@ Adding a new hosting application should be additive: add one `oauth_apps` entry 
 | Variable | Type | Default | Required? | Description |
 | --- | --- | --- | --- | --- |
 | `region` | `string` | `null` | No | OCI provider region. Defaults to `identity_domain_region` when omitted. |
-| `tenancy_ocid` | `string` | None | Yes | Tenancy OCID where IAM dynamic groups, groups, and policies are created. |
+| `tenancy_ocid` | `string` | None | Yes | Tenancy OCID used for Identity Domain lookup and Default-domain IAM groups, dynamic groups, and policies. |
 | `user_ocid` | `string` | `null` | No | Optional OCI API-key user OCID for local Terraform runs. |
 | `fingerprint` | `string` | `null` | No | Optional OCI API-key fingerprint for local Terraform runs. |
 | `private_key_path` | `string` | `null` | No | Optional OCI API private key path for local Terraform runs. |
 | `private_key_password` | `string` | `null` | No | Optional OCI API private key password for local Terraform runs. Sensitive. |
 | `resource_name_prefix` | `string` | `"token-factory"` | No | Prefix for shared Token Factory resource names. `null` or empty falls back to `token-factory`. |
-| `identity_domain_url` | `string` | None | Yes | Identity Domain base URL. |
+| `identity_domain_url` | `string` | None | Yes | Identity Domain base URL. Determines whether runtime principals are created in the Default domain or a custom Identity Domain. |
 | `identity_domain_region` | `string` | None | Yes | OCI region used for token exchange and Identity Domain data-plane calls. |
 | `enable_oci_secrets` | `bool` | `true` | No | When true, store OAuth app material in OCI Secrets and output secret OCIDs. |
 | `oci_secrets_compartment_ocid` | `string` | `null` | Conditional | Compartment for created or existing OCI Secrets and runtime secret-read policies. Required when secrets are enabled. |
@@ -100,6 +101,7 @@ Map keys are the canonical Token Factory `CallerContext.client_key` values and m
 | `runtime.resource_ocid` | No | Optional exact compute instance, OCI Function, or OKE cluster OCID. |
 | `runtime.oci_auth_profile` | No | Used only when `principal_type = "user-group"`; defaults to `DEFAULT` in runtime config. |
 | `runtime.oci_region` | No | Per-runtime `TF_SHARED_OCI_REGION`; falls back to `oci_secrets_region` or `identity_domain_region`. |
+| `runtime.database_access` | No | Optional object that creates a compartment-scoped IAM policy allowing the runtime dynamic group to use `database-connections` for one target database. |
 | `enable_identity_propagation_trust` | No | Create IdentityPropagationTrust for `oracle-database` and `oci-service` UPST flows. Defaults to true. |
 | `propagation_trust_claim_name` | No | Optional trust client claim name. Must be set with `propagation_trust_claim_value`. |
 | `propagation_trust_claim_value` | No | Optional trust client claim value. Must be set with `propagation_trust_claim_name`. |
@@ -131,9 +133,12 @@ For `MCP_SERVER`, the default per-app prefix is `mcp-server`.
 | --- | --- | --- |
 | `oci_identity_domains_app.these` | `mcp-server-client` | For each `oauth_apps` entry. |
 | `oci_identity_domains_identity_propagation_trust.these` | `mcp-server-identity-propagation-trust` | When propagation trust is enabled for the app. |
-| `oci_identity_dynamic_group.these` | `mcp-server-runtime-dynamic-group` | For compute, function, and OKE runtimes. |
-| `oci_identity_group.these` | `mcp-server-runtime-user-group` | For `user-group` runtimes. |
+| `oci_identity_dynamic_group.these` | `mcp-server-runtime-dynamic-group` | For compute, function, and OKE runtimes when `identity_domain_url` resolves to the Default domain. |
+| `oci_identity_group.these` | `mcp-server-runtime-user-group` | For `user-group` runtimes when `identity_domain_url` resolves to the Default domain. |
+| `oci_identity_domains_dynamic_resource_group.these` | `mcp-server-runtime-dynamic-group` | For compute, function, and OKE runtimes when `identity_domain_url` resolves to a custom Identity Domain. |
+| `oci_identity_domains_group.these` | `mcp-server-runtime-user-group` | For `user-group` runtimes when `identity_domain_url` resolves to a custom Identity Domain. |
 | `oci_identity_policy.these` | `mcp-server-secrets-policy` | For each app runtime. |
+| `oci_identity_policy.database_access` | `mcp-server-database-access-policy` | When `runtime.database_access` is set. |
 | `oci_vault_secret.client_credentials` | `mcp-server-client-credentials-secret` | When `enable_oci_secrets = true`. |
 | `oci_vault_secret.private_keys` | `mcp-server-jwt-private-key-secret` | When secrets are enabled and key material is generated or provided. |
 | `oci_vault_secret.private_key_passphrases` | `mcp-server-jwt-private-key-passphrase-secret` | When a passphrase secret is needed. |
@@ -143,22 +148,9 @@ For `MCP_SERVER`, the default per-app prefix is `mcp-server`.
 
 | Output | Description |
 | --- | --- |
-| `token_factory_shared_runtime_config` | Shared runtime config base. Excludes OAuth app identity fields and per-runtime OCI auth values. |
-| `token_factory_runtime_configs` | Full Token Factory runtime configuration by OAuth app key. |
-| `token_factory_runtime_config_env` | Shell `export` lines for `TF_SHARED_*` runtime configuration by OAuth app key. |
-| `token_factory_client_config_env` | Shell `export` lines for `TF_CLIENT_*` OAuth client configuration by OAuth app key. Contains secret OCID references, not inline secrets. |
-| `token_factory_client_sensitive_config_env` | Sensitive shell `export` lines for `TF_CLIENT_*` OAuth client configuration, including inline credentials and PEM values when `enable_oci_secrets = false`. |
-| `oauth_app_configs` | Non-sensitive `OAuthClientInfo`-shaped resolver config by OAuth app key. Contains secret OCID references, not inline secrets. |
-| `oauth_app_configs_json` | JSON-encoded non-sensitive resolver config for Vault-backed deployments. |
-| `oauth_app_sensitive_configs` | Sensitive resolver config including inline credentials and PEM values when `enable_oci_secrets = false`. |
-| `oauth_app_sensitive_configs_json` | JSON-encoded sensitive resolver config for direct-value deployments. |
-| `oauth_app_runtime_secret_ocids` | OAuth material secret OCIDs each OAuth app runtime must read. |
-| `runtime_secret_ocids` | Authz policy secret plus OAuth app secret OCIDs by OAuth app key. |
-| `runtime_principals` | Runtime IAM principal details by OAuth app key. |
-| `secret_policy_statements` | Generated Vault read policy statements by OAuth app key. |
-| `oauth_app_resource_ids` | App, grant, certificate, trust, IAM, and secret IDs by OAuth app key. |
-| `provisioned_resource_ids` | Combined shared and OAuth app/runtime resource IDs. |
-| `provisioned_resources` | Shared and OAuth app/runtime resources with names and OCIDs for lookup. |
+| `shared_runtime_config` | Shared Token Factory runtime config object. |
+| `clients_runtime_config` | Per-client non-sensitive OAuth resolver config with secret OCID references and optional database setup commands. |
+| `provisioned_resources` | Shared and OAuth app/runtime resources with names, OCIDs/IDs, generated policy statements, and selected Identity Domain metadata. |
 
 Regular outputs intentionally avoid inline credentials and PEM values. Direct-value resolver outputs are marked sensitive.
 
@@ -181,9 +173,9 @@ oci_vault_existing_ocid = var.vault_ocid
 
 Providing `oci_master_key_existing_ocid` without `oci_vault_existing_ocid` is invalid.
 
-Vault-backed deployments should use `oauth_app_configs_json` for constructor-based configuration or `token_factory_client_config_env` for environment-based configuration. Both outputs contain resolver config with secret OCID references.
+Vault-backed deployments should use `shared_runtime_config` plus `clients_runtime_config[<client_key>]`. Callers can derive shell export lines from `shared_runtime_config` when a hosting runtime is configured through environment variables.
 
-Direct-value deployments set `enable_oci_secrets = false` and use `oauth_app_sensitive_configs_json` or `token_factory_client_sensitive_config_env`. Terraform redacts those outputs by default.
+Direct-value deployments set `enable_oci_secrets = false`. Prefer Vault-backed mode for production because the simplified output surface intentionally avoids inline credentials and PEM values.
 
 ## Key Material Sources
 
@@ -211,6 +203,29 @@ Runtime IAM is configured per OAuth app with `oauth_apps[*].runtime.principal_ty
 Set `runtime.compartment_ocid` for every app. Optionally set `runtime.resource_ocid` to restrict dynamic group matching to one compute instance, OKE cluster, or OCI Function.
 
 For `user-group`, the module creates the group and policy but does not manage user membership. Add the intended API-key user through your normal IAM process.
+
+### Oracle Database Token Access
+
+Set `oauth_apps[*].runtime.database_access` when the runtime should call:
+
+```python
+factory.get_token("oracle-database", "OCI_PRINCIPAL", db_scope, client_key="MCP_SERVER")
+```
+
+The module creates a separate IAM policy for the runtime dynamic group and attaches it to `target_database_compartment_ocid`. The statement is:
+
+```text
+allow <dynamic-group-subject> to use database-connections in compartment id <target_database_compartment_ocid> where target.database.id = '<target_database_ocid>'
+```
+
+Default-domain policies use unquoted group names. Custom Identity Domain policies use quoted domain-qualified names, for example `dynamic-group 'example-domain'/'mcp-server-runtime-dynamic-group'`.
+
+`runtime.database_access` is valid only for dynamic-group runtimes (`compute-instance`, `oci-function`, or `oke-cluster`), not `user-group`. `clients_runtime_config[<client_key>].database_access` also emits the database-side setup commands:
+
+```sql
+CREATE USER <SANITIZED_DB_USER> IDENTIFIED GLOBALLY AS 'IAM_GROUP_NAME=<identity-domain-name>/<dynamic-group-name>';
+GRANT CREATE SESSION TO <SANITIZED_DB_USER>;
+```
 
 ## Security Notes
 
