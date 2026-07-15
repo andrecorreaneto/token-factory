@@ -198,18 +198,11 @@ When Vault-backed values are used, an IAM policy for the principal that runs the
 
 ### Terraform Bootstrap Module
 
-Use [../token-factory-bootstrap/README.md](Token Factory Bootstrap Module) to provision required infrastructure for Token Factory runtime.
+Use [Token Factory Bootstrap Module](./bootstrap/) to provision required infrastructure for Token Factory runtime.
 
-The [../token-factory-bootstrap/client](Bootstrap client wrapper) exposes a concise output surface that application teams can plug into their runtime environments:
+The [Token Factory Bootstrap Client Module](./bootstrap/client/) exposes a concise output surface that application teams can plug into their runtime environments.
 
-| Output | Use |
-| --- | --- |
-| `runtime_config_env` | Shared shell `export` lines for runtime config, for deployments configured through process environment variables. |
-| `runtime_config` | Shared constructor-shaped config for structured deployments. Pass it directly as `TokenFactory(runtime_config=runtime_config, oauth_apps=oauth_apps)`, or export `runtime_config_env` and omit it. |
-| `oauth_apps` | Required structured OAuth app config for TokenFactory assertion-backed flows. Use one entry for single-client processes and multiple entries for multi-client processes. |
-| `provisioned_resources` | Convenience lookup output with names and OCIDs for shared resources, OAuth apps, certificates, trusts, runtime principals, policies, and secrets. Null unless the client module sets `output_provisioned_resources = true`. |
-
-The following pre-requisites are fulfilled by the bootstrap module. They are presented here for awareness.
+The following Token Factory runtime requirements are automated by the bootstrap module. They are presented here for awareness.
 
 #### Identity Domain Pre-requisites
 
@@ -539,4 +532,4 @@ oauth_access_token = result["token"]
 - [docs/advanced-scenarios.md](./docs/advanced-scenarios.md)
 - [docs/oci-compute-usage.md](./docs/oci-compute-usage.md)
 - [samples/oci_compute_usage.py](./samples/oci_compute_usage.py)
-- [Token Factory Bootstrap Module](../token-factory-bootstrap/README.md)
+- [Token Factory Bootstrap Module](./bootstrap/)
