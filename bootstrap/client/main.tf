@@ -9,8 +9,9 @@ module "token_factory_bootstrap" {
   private_key_password = var.private_key_password
 
   resource_name_prefix   = var.resource_name_prefix
-  identity_domain_url    = var.identity_domain_url
-  identity_domain_region = var.identity_domain_region
+  identity_domain_compartment_ocid = var.identity_domain_compartment_ocid
+  identity_domain_url              = var.identity_domain_url
+  identity_domain_region           = var.identity_domain_region
 
   enable_oci_secrets                     = var.enable_oci_secrets
   oci_secrets_compartment_ocid           = var.oci_secrets_compartment_ocid
