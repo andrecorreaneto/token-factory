@@ -198,9 +198,9 @@ When Vault-backed values are used, an IAM policy for the principal that runs the
 
 ### Terraform Bootstrap Module
 
-Use [./bootstrap](Token Factory Bootstrap Module) to provision required infrastructure for Token Factory runtime.
+Use [Token Factory Bootstrap Module](./bootstrap/) to provision required infrastructure for Token Factory runtime.
 
-The [./bootstrap/client](Bootstrap client wrapper) exposes a concise output surface that application teams can plug into their runtime environments.
+The [Token Factory Bootstrap Client Module](./bootstrap/client/) exposes a concise output surface that application teams can plug into their runtime environments.
 
 The following Token Factory runtime requirements are automated by the bootstrap module. They are presented here for awareness.
 
