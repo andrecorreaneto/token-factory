@@ -29,10 +29,7 @@ class TokenFactoryRuntimeConfig:
             )
 
     @classmethod
-    def from_env(
-        cls,
-        config_overrides: Optional[Dict[str, Any]] = None,
-    ) -> "TokenFactoryRuntimeConfig":
+    def from_env(cls, config_overrides: Optional[Dict[str, Any]] = None) -> "TokenFactoryRuntimeConfig":
         def value(name: str, default: Optional[Any] = None) -> Optional[Any]:
             if config_overrides and name in config_overrides:
                 return config_overrides[name]

@@ -4,16 +4,16 @@ Most deployments should use `TokenFactory(oauth_apps=...)`. Use resolver and pro
 
 ### `OAuthClientInfo` fields
 
-Use these fields when constructing `oauth_apps` entries or when using `StaticOAuthClientResolver`, `VaultOAuthClientResolver`, or `LocalOAuthClientResolver` directly.
+Use these fields when constructing `oauth_apps` entries or when using `StaticOAuthClientResolver` or `VaultOAuthClientResolver` directly.
 
 | Field | Required | Purpose |
 | --- | --- | --- |
 | `client_credentials` | yes, unless `client_credentials_secret_ocid` is set | Direct `client_id:client_secret`. |
 | `client_credentials_secret_ocid` | yes, unless `client_credentials` is set | Vault secret containing `client_id:client_secret`. |
-| `issuer` | yes | JWT `iss` used when signing assertions for this hosting app. |
-| `private_key_pem` | one key source required | Direct private key PEM. |
-| `private_key_path` | one key source required | Local private key path. |
-| `private_key_secret_ocid` | one key source required | Vault secret containing private key PEM. |
+| `issuer` | yes for assertion-backed flows | JWT `iss` used when signing assertions for this hosting app. |
+| `private_key_pem` | one key source required for assertion-backed flows | Direct private key PEM. |
+| `private_key_path` | one key source required for assertion-backed flows | Local private key path. |
+| `private_key_secret_ocid` | one key source required for assertion-backed flows | Vault secret containing private key PEM. |
 | `private_key_passphrase` | optional | Direct private-key passphrase. |
 | `private_key_passphrase_secret_ocid` | optional | Vault secret containing the passphrase. |
 | `certificate_pem` | optional in resolver, required by Identity Domain setup | Direct certificate PEM matching the private key. |
@@ -100,7 +100,7 @@ factory = TokenFactory(
 
 Use this when app material is already available as direct values in process memory. This is useful for tests, local integration scripts, or controlled deployment systems that inject secrets outside OCI Vault.
 
-The `runtime_config` object below can also be supplied through process-wide shared runtime `TOKEN_FACTORY_*` variables. In that case, replace the explicit constructor with `TokenFactoryRuntimeConfig.from_env()`.
+The `runtime_config` object below can also be supplied through process-wide shared runtime `TF_SHARED_*` variables. In that case, replace the explicit constructor with `TokenFactoryRuntimeConfig.from_env()`.
 
 ```python
 from token_factory import (
@@ -162,73 +162,6 @@ factory = TokenFactory(
 result = factory.get_token(
     "<incoming-caller-access-token>",
     token_type="oauth",
-    scope="urn:opc:idm:orders.read",
-    client_key="orders-api",
-)
-
-oauth_access_token = result["token"]
-```
-
-### `LocalOAuthClientResolver`
-
-Use this for local development where you want direct local OAuth app material. Caller assertion validation still uses TokenFactory's built-in hybrid validation against the configured Identity Domain.
-
-The `runtime_config` object below can also be supplied through process-wide shared runtime `TOKEN_FACTORY_*` variables. In that case, replace the explicit constructor with `TokenFactoryRuntimeConfig.from_env()`.
-
-```python
-from token_factory import (
-    LocalOAuthClientResolver,
-    OAuthClientInfo,
-    StaticAuthorizationPolicyProvider,
-    TokenFactory,
-    TokenFactoryRuntimeConfig,
-)
-
-runtime_config = TokenFactoryRuntimeConfig(
-    domain_url="https://<domain>.identity.oraclecloud.com:443",
-    domain_region="us-chicago-1",
-    timeout_seconds=30,
-    oci_auth_mode="oci-profile",
-    oci_auth_profile="DEFAULT",
-    oci_region="us-chicago-1",
-    subject_claim="sub",
-    groups_claim="groups",
-)
-
-oauth_client_resolver = LocalOAuthClientResolver(
-    {
-        "orders-api": OAuthClientInfo(
-            client_credentials="local-client-id:local-client-secret",
-            issuer="https://orders-api.example.com/token-factory",
-            private_key_path="/home/opc/.oci/orders-api-token-factory-private-key.pem",
-            certificate_path="/home/opc/.oci/orders-api-token-factory-cert.pem",
-            kid="orders-api-token-factory-cert",
-            resource_audiences=["orders-api"],
-            required_incoming_scopes=["orders-api.invoke"],
-        )
-    }
-)
-
-authorization_policy_provider = StaticAuthorizationPolicyProvider.from_dict(
-    {
-        "version": 1,
-        "grants": {
-            "oauth": {
-                "orders-readers": ["urn:opc:idm:orders.read"],
-            },
-        },
-    }
-)
-
-factory = TokenFactory(
-    runtime_config=runtime_config,
-    oauth_client_resolver=oauth_client_resolver,
-    authorization_policy_provider=authorization_policy_provider,
-)
-
-result = factory.get_token(
-    "<incoming-caller-access-token>",
-    "oauth",
     scope="urn:opc:idm:orders.read",
     client_key="orders-api",
 )

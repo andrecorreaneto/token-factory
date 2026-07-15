@@ -19,8 +19,8 @@ python3 -m pip install -r requirements.txt
 For Vault-backed configuration on OCI Compute, use instance principals:
 
 ```bash
-export TOKEN_FACTORY_OCI_AUTH_MODE="instance-principal"
-export TOKEN_FACTORY_OCI_REGION="us-phoenix-1"
+export TF_SHARED_OCI_AUTH_MODE="instance-principal"
+export TF_SHARED_OCI_REGION="us-phoenix-1"
 ```
 
 The Compute instance principal must be allowed to read every OCI Vault secret referenced by TokenFactory:
@@ -34,14 +34,14 @@ allow dynamic-group <compute-dynamic-group> to read secret-bundles in compartmen
 Set shared Identity Domain runtime configuration through environment variables. Provide hosting component OAuth client configuration through the `oauth_apps` argument when constructing `TokenFactory`. A single-client process uses one `oauth_apps` entry and still passes its `client_key` on each `get_token(...)` call.
 
 ```bash
-export TOKEN_FACTORY_DOMAIN_URL="https://<domain>.identity.oraclecloud.com:443"
-export TOKEN_FACTORY_DOMAIN_REGION="us-chicago-1"
+export TF_SHARED_DOMAIN_URL="https://<domain>.identity.oraclecloud.com:443"
+export TF_SHARED_DOMAIN_REGION="us-chicago-1"
 
-export TOKEN_FACTORY_SUBJECT_CLAIM="sub"
-export TOKEN_FACTORY_GROUPS_CLAIM="groups"
-export TOKEN_FACTORY_AUTHZ_POLICY_ENABLE="true"
-export TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID="ocid1.vaultsecret.oc1..<authz-policy-secret>"
-export TOKEN_FACTORY_TIMEOUT_SECONDS="30"
+export TF_SHARED_SUBJECT_CLAIM="sub"
+export TF_SHARED_GROUPS_CLAIM="groups"
+export TF_SHARED_AUTHZ_POLICY_ENABLE="true"
+export TF_SHARED_AUTHZ_POLICY_SECRET_OCID="ocid1.vaultsecret.oc1..<authz-policy-secret>"
+export TF_SHARED_TIMEOUT_SECONDS="30"
 ```
 
 For command-line runs, store the structured OAuth app map in a protected JSON file:
@@ -54,6 +54,7 @@ For command-line runs, store the structured OAuth app map in a protected JSON fi
     "private_key_secret_ocid": "ocid1.vaultsecret.oc1..<private-key-secret>",
     "certificate_secret_ocid": "ocid1.vaultsecret.oc1..<certificate-secret>",
     "kid": "orders-api-cert",
+    "propagation_trust_claim": "upstclient:tokenexchange",
     "resource_audiences": [
       "orders-api"
     ],
@@ -66,17 +67,13 @@ For command-line runs, store the structured OAuth app map in a protected JSON fi
 
 The same `oauth_apps` structure is used for one client or many clients. Multi-client processes add more entries and select the intended one with `client_key`.
 
-For UPST-backed flows, include any propagation trust claim required by your IdentityPropagationTrust:
-
-```bash
-export TOKEN_FACTORY_PROPAGATION_TRUST_CLAIM="upstclient:tokenexchange"
-```
+For UPST-backed flows, include any propagation trust claim required by your IdentityPropagationTrust in each relevant `oauth_apps` entry.
 
 ## 3. Provide an Authorization Policy
 
-Authorization policy enforcement is opt-in and controlled only by `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE`. The default is `false`, which means TokenFactory does not run group-scope authorization checks for scoped requests. When `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=true`, `oauth` and `oracle-database` requests require a configured authorization policy and are denied if no policy is configured or no grant matches.
+Authorization policy enforcement is opt-in and controlled only by `TF_SHARED_AUTHZ_POLICY_ENABLE`. The default is `false`, which means TokenFactory does not run group-scope authorization checks for scoped requests. When `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, `oauth` and `oracle-database` requests require a configured authorization policy and are denied if no policy is configured or no grant matches.
 
-`TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID` configures the built-in Vault policy provider; it is not the enforcement switch. For development and local testing, keep the default raw JSON mode and store a JSON document like this in the secret referenced by `TOKEN_FACTORY_AUTHZ_POLICY_SECRET_OCID`:
+`TF_SHARED_AUTHZ_POLICY_SECRET_OCID` configures the built-in Vault policy provider; it is not the enforcement switch. For development and local testing, keep the default raw JSON mode and store a JSON document like this in the secret referenced by `TF_SHARED_AUTHZ_POLICY_SECRET_OCID`:
 
 ```json
 {
@@ -105,10 +102,10 @@ The incoming caller assertion must contain the group names in the configured gro
 For production, use signed policy mode:
 
 ```bash
-export TOKEN_FACTORY_AUTHZ_POLICY_SIGNATURE_MODE="on"
-export TOKEN_FACTORY_AUTHZ_POLICY_ENVIRONMENT="prod"
-export TOKEN_FACTORY_AUTHZ_POLICY_TENANT_ID="ocid1.tenancy.oc1..<prod-tenancy>"
-export TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON='[
+export TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE="on"
+export TF_SHARED_AUTHZ_POLICY_ENVIRONMENT="prod"
+export TF_SHARED_AUTHZ_POLICY_TENANT_ID="ocid1.tenancy.oc1..<prod-tenancy>"
+export TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON='[
   {
     "key_id": "ocid1.key.oc1..<security-owned-kms-key>",
     "key_version_id": "ocid1.keyversion.oc1..<security-owned-kms-key-version>",
@@ -120,7 +117,7 @@ export TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON='[
 
 In signed mode, the Vault secret must contain a signed envelope with `version`, `metadata`, `policy`, and `signature`. `metadata.signing_key_id` is the OCI KMS asymmetric key OCID, `metadata.signing_key_version_id` is the exact key version OCID, and `metadata.policy_digest` is `sha256:` plus the digest of the canonical policy JSON.
 
-The security team owns the production matrix and signing key. Developers must not have `manage keys` or `use keys` on that key, and must not be able to alter `TOKEN_FACTORY_AUTHZ_TRUSTED_SIGNERS_JSON`. The signature check is a second layer that rejects a Vault secret modified without the security-owned signer.
+The security team owns the production matrix and signing key. Developers must not have `manage keys` or `use keys` on that key, and must not be able to alter `TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON`. The signature check is a second layer that rejects a Vault secret modified without the security-owned signer.
 
 ## 4. Get an Incoming Caller Assertion
 
@@ -211,7 +208,7 @@ python3 samples/oci_compute_usage.py oracle-database \
   --access-token-file /secure/path/incoming_access_token.txt
 ```
 
-This flow validates the incoming assertion, authorizes the database scope when `TOKEN_FACTORY_AUTHZ_POLICY_ENABLE=true`, uses the selected hosting component OAuth client ID for IdentityPropagationTrust, and requests the database scoped access token.
+This flow validates the incoming assertion, authorizes the database scope when `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, uses the selected hosting component OAuth client ID for IdentityPropagationTrust, and requests the database scoped access token.
 
 ### OCI Service Signer
 
