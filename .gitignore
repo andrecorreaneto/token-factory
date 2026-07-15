@@ -19,3 +19,4 @@ docs/superpowers/*
 **/terraform.tfstate
 **/terraform.tfstate.backup
 **/.terraform.lock.hcl
+**/plan.out

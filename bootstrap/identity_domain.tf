@@ -1,6 +1,6 @@
 data "oci_identity_domains" "selected" {
   provider       = oci.home
-  compartment_id = var.tenancy_ocid
+  compartment_id = coalesce(var.identity_domain_compartment_ocid, var.tenancy_ocid)
 }
 
 resource "oci_identity_domains_oauth_partner_certificate" "these" {

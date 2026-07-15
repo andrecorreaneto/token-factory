@@ -40,6 +40,12 @@ variable "resource_name_prefix" {
   default     = "token-factory"
 }
 
+variable "identity_domain_compartment_ocid" {
+  description = "Compartment OCID of the provided Identity Domain."
+  type        = string
+  default     = null
+}
+
 variable "identity_domain_url" {
   description = "Identity Domain base URL."
   type        = string
