@@ -367,6 +367,8 @@ These variables populate `TokenFactoryRuntimeConfig` or process-level TokenFacto
 | `TF_SHARED_GROUPS_CLAIM` | optional | Claim name used to extract caller groups for authorization; defaults to `groups`. |
 | `TF_SHARED_LOG_FULL_ASSERTION` | optional | Enables full compact JWT logging. Use only for controlled troubleshooting because assertions are replay-sensitive. |
 | `TF_SHARED_LOG_LEVEL` | optional | Module logger level; defaults to `INFO`. Accepted values are `CRITICAL`, `FATAL`, `ERROR`, `WARNING`, `WARN`, `INFO`, `DEBUG`, and `NOTSET`. |
+| `TF_SHARED_CACHE_ENABLE` | optional | Enables the instance-local TokenFactory result cache when set to `1`, `true`, `yes`, `y`, or `on`; defaults to `false`. Caller-bound cache hits still validate and authorize the incoming assertion before reusing downstream results. |
+| `TF_SHARED_CACHE_MAX_SIZE` | optional | Maximum number of cached TokenFactory results per instance; defaults to `1024`. When full, the cache evicts the least recently used entry. |
 
 ### Authorization policy environment variables
 
@@ -423,6 +425,7 @@ Important behavior details:
 - `userid` validates the incoming assertion and extracts the configured subject claim, but does not run group/scope authorization.
 - `oci-service` validates the incoming assertion and returns an OCI `TokenExchangeSigner`; it does not run group/scope authorization because it has no requested downstream scope.
 - `get_token_with_oci_credential()` is a separate OAuth token-exchange API for OCI signer dictionaries or OCI CLI profile names. Current code does not validate an end-user assertion and does not run group/scope authorization for that API.
+- `TF_SHARED_CACHE_ENABLE=true` lets a TokenFactory instance reuse unexpired downstream OAuth, Oracle Database, OCI service signer, and OCI-credential OAuth results. Cache keys use request dimensions and credential fingerprints, opaque responses without a reliable expiration are not cached, and `TF_SHARED_CACHE_MAX_SIZE` bounds memory by evicting least recently used entries.
 - Vault-backed OAuth app values require the hosting runtime principal to read the referenced secrets.
 - Direct creds, local key files, and inline PEM/cert values avoid Vault reads for those materials.
 - `TF_SHARED_OCI_AUTH_MODE` and `TF_SHARED_OCI_AUTH_PROFILE` apply to factory-owned OCI clients generally, including Vault secret reads.

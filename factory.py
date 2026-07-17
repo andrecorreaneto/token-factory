@@ -1,8 +1,12 @@
 """TokenFactory facade for converting caller or OCI credentials into downstream tokens."""
 
 import base64
+import hashlib
+import json
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlencode, urlsplit
@@ -25,6 +29,7 @@ from ._authorization import (
 from ._errors import CallerAssertionValidationError, OAuthClientResolutionError
 from ._factory_support import (
     ConfigurationError,
+    LOGGER,
     OCI_IDENTITY_AUDIENCE,
     SUPPORTED_TOKEN_TYPES,
     TokenExchangeError,
@@ -86,10 +91,59 @@ class OracleDatabaseTokenResult(tuple):
         return value
 
 
+@dataclass(frozen=True)
+class TokenCacheEntry:
+    """Cached TokenFactory result and its absolute expiration time."""
+
+    result: Any
+    expires_at_epoch: int
+
+
+class TokenResultCache:
+    """Thread-safe in-memory cache for reusable TokenFactory results."""
+
+    def __init__(self, max_size: int = 1024):
+        self._entries: OrderedDict[str, TokenCacheEntry] = OrderedDict()
+        self._lock = threading.RLock()
+        self._max_size = max(1, int(max_size))
+
+    def get(self, key: str, now: int, skew_seconds: int, label: str) -> Any | None:
+        """Return a cached result when it remains valid after the safety skew."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                LOGGER.info("TokenFactory cache miss label=%s reason=absent key=%s", label, _cache_key_hint(key))
+                return None
+            if entry.expires_at_epoch <= now + skew_seconds:
+                self._entries.pop(key, None)
+                LOGGER.info("TokenFactory cache miss label=%s reason=expired key=%s", label, _cache_key_hint(key))
+                return None
+            self._entries.move_to_end(key)
+            LOGGER.info("TokenFactory cache hit label=%s key=%s expires_in_seconds=%s", label, _cache_key_hint(key), entry.expires_at_epoch - now)
+            return _copy_cached_result(entry.result)
+
+    def set(self, key: str, result: Any, expires_at_epoch: int, now: int, skew_seconds: int) -> Any:
+        """Store a result if it has a reusable lifetime."""
+        if expires_at_epoch <= now + skew_seconds:
+            return result
+        with self._lock:
+            self._entries[key] = TokenCacheEntry(_copy_cached_result(result), expires_at_epoch)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_size:
+                evicted_key, _entry = self._entries.popitem(last=False)
+                LOGGER.info("TokenFactory cache eviction reason=max_size key=%s max_size=%s", _cache_key_hint(evicted_key), self._max_size)
+        return result
+
+    def clear(self) -> None:
+        """Remove every cached result."""
+        with self._lock:
+            self._entries.clear()
+
+
 class TokenFactory:
     """Exchanges caller or OCI credentials for documented downstream token shapes."""
 
-    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = TokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer):
+    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = TokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer, token_cache_enabled: Optional[bool] = None, token_cache: Optional[TokenResultCache] = None, token_cache_skew_seconds: int = 5, token_cache_max_size: Optional[int] = None):
         """Configure runtime settings, OAuth client resolution, authorization, and exchange clients."""
         if config_overrides is not None and not isinstance(config_overrides, dict):
             raise TypeError("TokenFactory expects no positional argument or a config overrides dict.")
@@ -117,6 +171,10 @@ class TokenFactory:
         self._db_token_generator = db_token_generator
         self._factory_oci_signer_builder = factory_oci_signer_builder
         self._oci_signer_builder = oci_signer_builder
+        self._token_cache_enabled = runtime_config.cache_enable if token_cache_enabled is None else bool(token_cache_enabled)
+        resolved_cache_max_size = runtime_config.cache_max_size if token_cache_max_size is None else token_cache_max_size
+        self._token_cache = token_cache or TokenResultCache(resolved_cache_max_size)
+        self._token_cache_skew_seconds = max(0, int(token_cache_skew_seconds))
 
     @classmethod
     def from_env(cls, config_overrides: Optional[Dict[str, Any]] = None) -> "TokenFactory":
@@ -141,6 +199,11 @@ class TokenFactory:
 
     def get_token_with_oci_credential(self, credential: Credential, scope: Optional[str] = None) -> Dict[str, Any]:
         """Exchange an OCI signer dictionary or profile name for an OAuth token."""
+        cache_key = _cache_key("oci-credential-oauth", scope or "", _oci_credential_cache_identity(credential))
+        cached = self._get_cached_result(cache_key, "oci-credential-oauth")
+        if cached is not None:
+            return cached
+
         signer_credential = self._resolve_oci_credential(credential)
         signer = self._oci_signer_builder(signer_credential)
         endpoint = f"{self._runtime_config.domain_url}/oauth2/v1/token"
@@ -161,7 +224,11 @@ class TokenFactory:
             auth=signer,
             timeout=self._runtime_config.timeout_seconds,
         )
-        return _oauth_result(_response_payload_or_raise(response, "OCI credential OAuth exchange"))
+        return self._cache_result(cache_key, _oauth_result(_response_payload_or_raise(response, "OCI credential OAuth exchange")))
+
+    def clear_token_cache(self) -> None:
+        """Remove cached TokenFactory results for this instance."""
+        self._token_cache.clear()
 
     def _get_oauth_token(self, credential: Credential, scope: Optional[str], client_key: str) -> Dict[str, Any]:
         requested_scope = _require_scope(scope, "oauth")
@@ -170,7 +237,11 @@ class TokenFactory:
                 client_key,
                 require_signing_material=False,
             )
-            return self._exchange_client_credentials_for_oauth(requested_scope, hosting_component)
+            cache_key = _cache_key("oauth-client-credentials", client_key, requested_scope)
+            cached = self._get_cached_result(cache_key, "oauth-client-credentials")
+            if cached is not None:
+                return cached
+            return self._cache_result(cache_key, self._exchange_client_credentials_for_oauth(requested_scope, hosting_component))
 
         assertion = _require_caller_assertion(credential, "oauth")
         context = self._validate_assertion(assertion, client_key)
@@ -179,19 +250,24 @@ class TokenFactory:
         if _validated_token_can_be_passed_through(context, issued_scope, requested_scope):
             return _incoming_oauth_result(assertion)
 
+        cache_key = _cache_key("oauth-assertion", client_key, requested_scope, _secret_fingerprint(assertion))
+        cached = self._get_cached_result(cache_key, "oauth-assertion")
+        if cached is not None:
+            return cached
+
         jwt_assertion = self._build_jwt_assertion(context.subject, context.hosting_component, "oauth")
-        return self._exchange_assertion_for_oauth(
-            jwt_assertion,
-            requested_scope,
-            context.hosting_component,
-        )
+        return self._cache_result(cache_key, self._exchange_assertion_for_oauth(jwt_assertion, requested_scope, context.hosting_component), assertion)
 
     def _get_oracle_database_token(self, credential: Credential, scope: Optional[str], client_key: str) -> OracleDatabaseTokenResult:
         requested_scope = _require_scope(scope, "oracle-database")
         selector = _oracle_database_credential_selector(credential)
         if selector == ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL:
             _require_oci_principal_database_auth_mode(self._runtime_config)
-            return self._exchange_oracle_database_token_with_oci_principal(requested_scope)
+            cache_key = _cache_key("oracle-database-oci-principal", requested_scope, self._runtime_config.oci_auth_mode, self._runtime_config.domain_url, self._runtime_config.domain_region)
+            cached = self._get_cached_result(cache_key, "oracle-database-oci-principal")
+            if cached is not None:
+                return cached
+            return self._cache_result(cache_key, self._exchange_oracle_database_token_with_oci_principal(requested_scope))
         if selector == ORACLE_DATABASE_CREDENTIAL_PROCESS:
             raise NotImplementedError(
                 "oracle-database credential selector 'PROCESS' is reserved for future RPST process-principal support and is not implemented yet."
@@ -200,7 +276,11 @@ class TokenFactory:
         assertion = _require_caller_assertion(credential, "oracle-database")
         context = self._validate_assertion(assertion, client_key)
         self._authorize(context, "oracle-database", requested_scope)
-        return self._exchange_oracle_database_token(context.subject, context.hosting_component, requested_scope)
+        cache_key = _cache_key("oracle-database-assertion", client_key, requested_scope, _secret_fingerprint(assertion))
+        cached = self._get_cached_result(cache_key, "oracle-database-assertion")
+        if cached is not None:
+            return cached
+        return self._cache_result(cache_key, self._exchange_oracle_database_token(context.subject, context.hosting_component, requested_scope), assertion)
 
     def _get_userid_token(self, credential: Credential, client_key: str) -> Dict[str, Any]:
         assertion = _require_caller_assertion(credential, "userid")
@@ -210,7 +290,31 @@ class TokenFactory:
     def _get_oci_service_token(self, credential: Credential, client_key: str) -> Any:
         assertion = _require_caller_assertion(credential, "oci-service")
         context = self._validate_assertion(assertion, client_key)
-        return self._exchange_oci_service_token(context.subject, context.hosting_component)
+        cache_key = _cache_key("oci-service", client_key, _secret_fingerprint(assertion))
+        cached = self._get_cached_result(cache_key, "oci-service")
+        if cached is not None:
+            return cached
+        return self._cache_result(cache_key, self._exchange_oci_service_token(context.subject, context.hosting_component), assertion, max_expires_at_epoch=int(time.time()) + 300)
+
+    def _get_cached_result(self, cache_key: str, cache_label: str) -> Any | None:
+        """Return a cached result when cache is enabled and the entry is valid."""
+        if not self._token_cache_enabled:
+            return None
+        return self._token_cache.get(cache_key, int(time.time()), self._token_cache_skew_seconds, cache_label)
+
+    def _cache_result(self, cache_key: str, result: Any, caller_assertion: Optional[str] = None, *, max_expires_at_epoch: Optional[int] = None) -> Any:
+        """Cache a result when cache is enabled and a reliable expiration is available."""
+        if not self._token_cache_enabled:
+            return result
+        expires_at_epoch = _result_expires_at_epoch(result)
+        if expires_at_epoch <= 0 and max_expires_at_epoch is not None:
+            expires_at_epoch = max_expires_at_epoch
+        if caller_assertion:
+            caller_expires_at_epoch = _expires_at_epoch(caller_assertion)
+            expires_at_epoch = min(expires_at_epoch, caller_expires_at_epoch) if expires_at_epoch > 0 else caller_expires_at_epoch
+        if max_expires_at_epoch is not None:
+            expires_at_epoch = min(expires_at_epoch, max_expires_at_epoch)
+        return self._token_cache.set(cache_key, result, expires_at_epoch, int(time.time()), self._token_cache_skew_seconds)
 
     def _validate_assertion(self, credential: str, client_key: str) -> CallerContext:
         hosting_component = self._resolve_hosting_component(client_key)
@@ -544,6 +648,58 @@ def _oauth_result(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _copy_cached_result(result: Any) -> Any:
+    """Return a caller-safe copy for mutable cached result shapes."""
+    if isinstance(result, dict):
+        return dict(result)
+    return result
+
+
+def _cache_key(*parts: Any) -> str:
+    """Build a deterministic cache key from non-secret or pre-fingerprinted parts."""
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
+
+def _cache_key_hint(key: str) -> str:
+    """Return a short non-secret cache key hint for logs."""
+    return key[:12]
+
+
+def _secret_fingerprint(value: str) -> str:
+    """Hash a sensitive string before using it as a cache-key dimension."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _credential_fingerprint(credential: Any) -> str:
+    """Hash an OCI credential shape before using it as a cache-key dimension."""
+    serialized = json.dumps(credential, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _oci_credential_cache_identity(credential: Credential) -> str:
+    """Return a stable fingerprint for an OCI signer dictionary or profile name."""
+    if isinstance(credential, str):
+        return _secret_fingerprint(f"profile:{credential}")
+    return _credential_fingerprint(credential)
+
+
+def _result_expires_at_epoch(result: Any) -> int:
+    """Return a reliable absolute expiration time for cacheable result shapes."""
+    if isinstance(result, OracleDatabaseTokenResult):
+        return int(result.expires_at_epoch)
+    if isinstance(result, dict):
+        expires_in = result.get("expires_in")
+        if expires_in is not None:
+            try:
+                return int(time.time()) + int(expires_in)
+            except (TypeError, ValueError):
+                pass
+        access_token = result.get("access_token") or result.get("token")
+        if isinstance(access_token, str) and access_token:
+            return _jwt_expires_at_epoch(access_token)
+    return 0
+
+
 def _incoming_oauth_result(access_token: str) -> Dict[str, Any]:
     return {
         "token": access_token,
@@ -643,3 +799,14 @@ def _expires_at_epoch(token: str) -> int:
     except Exception:
         pass
     return int(time.time()) + 3600
+
+
+def _jwt_expires_at_epoch(token: str) -> int:
+    try:
+        payload = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
+        expires_at = int(payload.get("exp", 0))
+        if expires_at > 0:
+            return expires_at
+    except Exception:
+        pass
+    return 0
