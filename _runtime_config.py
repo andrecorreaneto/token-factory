@@ -21,12 +21,16 @@ class TokenFactoryRuntimeConfig:
     authz_policy_environment: Optional[str] = None
     authz_policy_tenant_id: Optional[str] = None
     log_full_assertion: bool = False
+    cache_enable: bool = False
+    cache_max_size: int = 1024
 
     def __post_init__(self) -> None:
         if self.authz_policy_signature_mode not in {"off", "on"}:
             raise ValueError(
                 "authz_policy_signature_mode must be 'off' or 'on'"
             )
+        if self.cache_max_size < 1:
+            raise ValueError("cache_max_size must be greater than or equal to 1")
 
     @classmethod
     def from_env(cls, config_overrides: Optional[Dict[str, Any]] = None) -> "TokenFactoryRuntimeConfig":
@@ -43,6 +47,13 @@ class TokenFactoryRuntimeConfig:
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"TF_SHARED_TIMEOUT_SECONDS must be an integer, got '{timeout_raw}'"
+            ) from exc
+        cache_max_size_raw = value("TF_SHARED_CACHE_MAX_SIZE", "1024") or "1024"
+        try:
+            cache_max_size = int(cache_max_size_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"TF_SHARED_CACHE_MAX_SIZE must be an integer, got '{cache_max_size_raw}'"
             ) from exc
         signature_mode = str(
             value("TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE", "off") or "off"
@@ -88,6 +99,8 @@ class TokenFactoryRuntimeConfig:
                 else None
             ),
             log_full_assertion=_coerce_bool(value("TF_SHARED_LOG_FULL_ASSERTION", False)),
+            cache_enable=_coerce_bool(value("TF_SHARED_CACHE_ENABLE", False)),
+            cache_max_size=cache_max_size,
         )
 
     @classmethod
@@ -100,6 +113,8 @@ class TokenFactoryRuntimeConfig:
             oci_auth_profile=config.oci_auth_profile or "DEFAULT",
             oci_region=config.assertion_oci_region,
             log_full_assertion=config.log_full_assertion,
+            cache_enable=getattr(config, "cache_enable", False),
+            cache_max_size=getattr(config, "cache_max_size", 1024),
         )
 
 

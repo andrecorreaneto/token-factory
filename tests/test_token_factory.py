@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 
 class _FakeJwt(types.ModuleType):
@@ -149,6 +151,7 @@ from token_factory import (  # noqa: E402
     StaticAuthorizationPolicyProvider,
     TokenExchangeError,
     TokenFactory,
+    TokenFactoryRuntimeConfig,
 )
 from token_factory._errors import CallerAssertionValidationError  # noqa: E402
 from token_factory._token_validation import ValidatedCallerAssertion  # noqa: E402
@@ -431,6 +434,206 @@ class TokenFactorySimplificationTests(unittest.TestCase):
         self.assertEqual(result["access_token"], "issued-token")
         self.assertEqual(signer_calls[0]["profile"], "DEFAULT")
         self.assertEqual(session.calls[0][1]["auth"], "profile-signer")
+
+    def test_cache_enable_defaults_false_and_reads_env(self):
+        with patch.dict(os.environ, {"TF_SHARED_DOMAIN_URL": "https://idcs.example.com", "TF_SHARED_DOMAIN_REGION": "us-ashburn-1"}, clear=True):
+            self.assertFalse(TokenFactoryRuntimeConfig.from_env().cache_enable)
+        with patch.dict(os.environ, {"TF_SHARED_DOMAIN_URL": "https://idcs.example.com", "TF_SHARED_DOMAIN_REGION": "us-ashburn-1", "TF_SHARED_CACHE_ENABLE": "true"}, clear=True):
+            self.assertTrue(TokenFactoryRuntimeConfig.from_env().cache_enable)
+
+    def test_cache_max_size_defaults_and_reads_env(self):
+        with patch.dict(os.environ, {"TF_SHARED_DOMAIN_URL": "https://idcs.example.com", "TF_SHARED_DOMAIN_REGION": "us-ashburn-1"}, clear=True):
+            self.assertEqual(TokenFactoryRuntimeConfig.from_env().cache_max_size, 1024)
+        with patch.dict(os.environ, {"TF_SHARED_DOMAIN_URL": "https://idcs.example.com", "TF_SHARED_DOMAIN_REGION": "us-ashburn-1", "TF_SHARED_CACHE_MAX_SIZE": ""}, clear=True):
+            self.assertEqual(TokenFactoryRuntimeConfig.from_env().cache_max_size, 1024)
+        with patch.dict(os.environ, {"TF_SHARED_DOMAIN_URL": "https://idcs.example.com", "TF_SHARED_DOMAIN_REGION": "us-ashburn-1", "TF_SHARED_CACHE_MAX_SIZE": "2"}, clear=True):
+            self.assertEqual(TokenFactoryRuntimeConfig.from_env().cache_max_size, 2)
+
+    def test_cache_max_size_rejects_invalid_values(self):
+        with patch.dict(os.environ, {"TF_SHARED_DOMAIN_URL": "https://idcs.example.com", "TF_SHARED_DOMAIN_REGION": "us-ashburn-1", "TF_SHARED_CACHE_MAX_SIZE": "nope"}, clear=True):
+            with self.assertRaises(ValueError):
+                TokenFactoryRuntimeConfig.from_env()
+        with self.assertRaises(ValueError):
+            TokenFactoryRuntimeConfig(domain_url="https://idcs.example.com", domain_region="us-ashburn-1", cache_max_size=0)
+
+    def test_cache_disabled_by_default_does_not_reuse_client_credentials_token(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session)
+
+        factory.get_token(None, "oauth", "database-scope", client_key="orders")
+        factory.get_token(None, "oauth", "database-scope", client_key="orders")
+
+        self.assertEqual(len(session.calls), 2)
+
+    def test_constructor_override_can_enable_client_credentials_cache(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=False), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session, token_cache_enabled=True)
+
+        first = factory.get_token(None, "oauth", "database-scope", client_key="orders")
+        second = factory.get_token(None, "oauth", "database-scope", client_key="orders")
+
+        self.assertEqual(first["access_token"], "issued-token")
+        self.assertEqual(second["access_token"], "issued-token")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_constructor_override_can_disable_runtime_cache(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session, token_cache_enabled=False)
+
+        factory.get_token(None, "oauth", "database-scope", client_key="orders")
+        factory.get_token(None, "oauth", "database-scope", client_key="orders")
+
+        self.assertEqual(len(session.calls), 2)
+
+    def test_assertion_backed_oauth_cache_still_validates_every_call(self):
+        session = FakeTokenEndpointSession()
+        validator = FakeTokenValidator(incoming_scopes=["other"])
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(), token_endpoint_session=session, token_validator=validator)
+
+        first = factory.get_token("caller.jwt", "oauth", "orders.read", client_key="orders")
+        second = factory.get_token("caller.jwt", "oauth", "orders.read", client_key="orders")
+
+        self.assertEqual(first["access_token"], "issued-token")
+        self.assertEqual(second["access_token"], "issued-token")
+        self.assertEqual(len(validator.calls), 2)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_expired_oauth_cache_entry_triggers_new_exchange(self):
+        session = FakeTokenEndpointSession(FakeResponse({"access_token": "issued-token", "token_type": "Bearer", "expires_in": 1}))
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session)
+
+        factory.get_token(None, "oauth", "database-scope", client_key="orders")
+        factory.get_token(None, "oauth", "database-scope", client_key="orders")
+
+        self.assertEqual(len(session.calls), 2)
+
+    def test_cache_key_separates_scope(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session)
+
+        factory.get_token(None, "oauth", "database-scope-a", client_key="orders")
+        factory.get_token(None, "oauth", "database-scope-b", client_key="orders")
+
+        self.assertEqual(len(session.calls), 2)
+
+    def test_cached_dict_mutation_does_not_poison_cache(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session)
+
+        first = factory.get_token(None, "oauth", "database-scope", client_key="orders")
+        first["access_token"] = "mutated"
+        second = factory.get_token(None, "oauth", "database-scope", client_key="orders")
+
+        self.assertEqual(second["access_token"], "issued-token")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_cache_logs_miss_and_hit(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session)
+
+        with self.assertLogs("token_factory", level="INFO") as logs:
+            factory.get_token(None, "oauth", "database-scope", client_key="orders")
+            factory.get_token(None, "oauth", "database-scope", client_key="orders")
+
+        rendered_logs = "\n".join(logs.output)
+        self.assertIn("TokenFactory cache miss label=oauth-client-credentials reason=absent", rendered_logs)
+        self.assertIn("TokenFactory cache hit label=oauth-client-credentials", rendered_logs)
+
+    def test_cache_evicts_least_recently_used_entry_when_max_size_is_reached(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=2), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session)
+
+        factory.get_token(None, "oauth", "scope-a", client_key="orders")
+        factory.get_token(None, "oauth", "scope-b", client_key="orders")
+        factory.get_token(None, "oauth", "scope-a", client_key="orders")
+        factory.get_token(None, "oauth", "scope-c", client_key="orders")
+        factory.get_token(None, "oauth", "scope-b", client_key="orders")
+
+        self.assertEqual(len(session.calls), 4)
+
+    def test_cache_eviction_is_logged(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=1), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session)
+
+        with self.assertLogs("token_factory", level="INFO") as logs:
+            factory.get_token(None, "oauth", "scope-a", client_key="orders")
+            factory.get_token(None, "oauth", "scope-b", client_key="orders")
+
+        self.assertIn("TokenFactory cache eviction reason=max_size", "\n".join(logs.output))
+
+    def test_constructor_override_can_set_cache_max_size(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=10), oauth_apps=oauth_apps(private_key_pem=None, issuer=None), token_endpoint_session=session, token_cache_max_size=1)
+
+        factory.get_token(None, "oauth", "scope-a", client_key="orders")
+        factory.get_token(None, "oauth", "scope-b", client_key="orders")
+        factory.get_token(None, "oauth", "scope-a", client_key="orders")
+
+        self.assertEqual(len(session.calls), 3)
+
+    def test_oci_principal_database_token_cache_reuses_generator_result(self):
+        calls = []
+
+        def db_token_generator(signer, public_key_pem, scope, config):
+            calls.append((signer, public_key_pem, scope, config.oci_auth_mode))
+            return "header.payload.signature"
+
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(), factory_oci_signer_builder=lambda _config: "factory-signer", db_token_generator=db_token_generator)
+
+        first = factory.get_token("oracle-database", "oci_principal", "urn:oracle:db::id::*", client_key="orders")
+        second = factory.get_token("oracle-database", "oci_principal", "urn:oracle:db::id::*", client_key="orders")
+
+        self.assertIs(first, second)
+        self.assertEqual(len(calls), 1)
+
+    def test_assertion_backed_database_cache_still_validates_every_call(self):
+        calls = []
+        validator = FakeTokenValidator()
+
+        def db_token_generator(signer, public_key_pem, scope, config):
+            calls.append((signer, public_key_pem, scope))
+            return "header.payload.signature"
+
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(), token_validator=validator, token_exchange_signer_cls=lambda *_args, **_kwargs: "upst-signer", signer_keypair_extractor=lambda _signer: ("public-key", "private-key"), db_token_generator=db_token_generator)
+
+        first = factory.get_token("caller.jwt", "oracle-database", "urn:oracle:db::id::*", client_key="orders")
+        second = factory.get_token("caller.jwt", "oracle-database", "urn:oracle:db::id::*", client_key="orders")
+
+        self.assertIs(first, second)
+        self.assertEqual(len(validator.calls), 2)
+        self.assertEqual(len(calls), 1)
+
+    def test_oci_service_cache_still_validates_every_call(self):
+        validator = FakeTokenValidator()
+        signer_calls = []
+
+        class CountingTokenExchangeSigner(_FakeTokenExchangeSigner):
+            def __init__(self, *args, **kwargs):
+                signer_calls.append((args, kwargs))
+                super().__init__(*args, **kwargs)
+
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(), token_validator=validator, token_exchange_signer_cls=CountingTokenExchangeSigner)
+
+        first = factory.get_token("caller.jwt", "oci-service", client_key="orders")
+        second = factory.get_token("caller.jwt", "oci-service", client_key="orders")
+
+        self.assertIs(first, second)
+        self.assertEqual(len(validator.calls), 2)
+        self.assertEqual(len(signer_calls), 1)
+
+    def test_get_token_with_oci_credential_cache_reuses_oauth_exchange(self):
+        session = FakeTokenEndpointSession()
+        signer_calls = []
+        credential = {"tenancy": "tenancy", "user": "user", "fingerprint": "fingerprint", "region": "us-ashburn-1", "private_key_content": "key"}
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), token_endpoint_session=session, oci_signer_builder=lambda value: signer_calls.append(value) or "oci-signer")
+
+        first = factory.get_token_with_oci_credential(credential, scope="orders.read")
+        second = factory.get_token_with_oci_credential(credential, scope="orders.read")
+
+        self.assertEqual(first["access_token"], "issued-token")
+        self.assertEqual(second["access_token"], "issued-token")
+        self.assertEqual(len(signer_calls), 1)
+        self.assertEqual(len(session.calls), 1)
 
 
 class HttpServiceTests(unittest.TestCase):
