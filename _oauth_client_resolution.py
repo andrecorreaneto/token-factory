@@ -14,14 +14,7 @@ class OAuthClientInfo:
     client_credentials: Optional[str] = None
     client_credentials_secret_ocid: Optional[str] = None
     issuer: Optional[str] = None
-    private_key_pem: Optional[str] = None
-    private_key_path: Optional[str] = None
-    private_key_secret_ocid: Optional[str] = None
-    private_key_passphrase: Optional[str] = None
-    private_key_passphrase_secret_ocid: Optional[str] = None
     certificate_pem: Optional[str] = None
-    certificate_path: Optional[str] = None
-    certificate_secret_ocid: Optional[str] = None
     kid: Optional[str] = None
     kms_key_id: Optional[str] = None
     kms_key_version_id: Optional[str] = None
@@ -36,10 +29,8 @@ class OAuthClientIdentity:
     client_id: str
     client_secret: str
     issuer: Optional[str] = None
-    private_key_pem: Optional[str] = None
     certificate_pem: Optional[str] = None
     kid: Optional[str] = None
-    private_key_passphrase: Optional[str] = None
     kms_key_id: Optional[str] = None
     kms_key_version_id: Optional[str] = None
     kms_crypto_endpoint: Optional[str] = None
@@ -90,28 +81,9 @@ class StaticOAuthClientResolver(OAuthClientResolver):
             ),
             "client credentials",
         )
-        private_key_pem = None
         certificate_pem = None
-        private_key_passphrase = None
-        if require_signing_material:
-            private_key_pem = _resolve_required_value(
-                direct_value=info.private_key_pem or _read_text_file(info.private_key_path),
-                secret_ocid=info.private_key_secret_ocid,
-                secret_reader=secret_reader,
-                label="private key",
-            )
-            certificate_pem = _resolve_optional_value(
-                direct_value=info.certificate_pem or _read_text_file(info.certificate_path),
-                secret_ocid=info.certificate_secret_ocid,
-                secret_reader=secret_reader,
-            )
-            private_key_passphrase = _resolve_optional_value(
-                direct_value=info.private_key_passphrase,
-                secret_ocid=info.private_key_passphrase_secret_ocid,
-                secret_reader=secret_reader,
-            )
-            if not info.issuer:
-                raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
+        if require_signing_material and not info.issuer:
+            raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
 
         return ResolvedHostingComponent(
             client_key=client_key,
@@ -119,10 +91,8 @@ class StaticOAuthClientResolver(OAuthClientResolver):
                 client_id=client_id,
                 client_secret=client_secret,
                 issuer=info.issuer,
-                private_key_pem=private_key_pem,
                 certificate_pem=certificate_pem,
                 kid=info.kid,
-                private_key_passphrase=private_key_passphrase,
                 kms_key_id=info.kms_key_id,
                 kms_key_version_id=info.kms_key_version_id,
                 kms_crypto_endpoint=info.kms_crypto_endpoint,

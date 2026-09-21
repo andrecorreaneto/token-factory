@@ -382,11 +382,9 @@ class TokenFactory:
 
         if self._jwt_assertion_signer is not None:
             return _sign_compact_jws(headers, payload, self._jwt_assertion_signer)
-        if identity.kms_key_id and identity.kms_key_version_id and identity.kms_crypto_endpoint:
-            return _sign_compact_jws(headers, payload, KmsJwtSigner(identity.kms_key_id, identity.kms_key_version_id, identity.kms_crypto_endpoint, self._factory_oci_signer_builder, self._runtime_config))
-        _, private_key_pem = _require_signing_identity(identity, hosting_component.client_key)
-        key = _load_private_key(private_key_pem, identity.private_key_passphrase)
-        return jwt.encode(payload, key=key, algorithm="RS256", headers=headers)
+        if not identity.kms_key_id or not identity.kms_key_version_id or not identity.kms_crypto_endpoint:
+            raise OAuthClientResolutionError(f"OAuth client '{hosting_component.client_key}' requires KMS key ID, key version ID, and cryptographic endpoint.")
+        return _sign_compact_jws(headers, payload, KmsJwtSigner(identity.kms_key_id, identity.kms_key_version_id, identity.kms_crypto_endpoint, self._factory_oci_signer_builder, self._runtime_config))
 
     def _exchange_assertion_for_oauth(self, assertion: str, scope: Optional[str], hosting_component: ResolvedHostingComponent) -> Dict[str, Any]:
         identity = hosting_component.oauth_identity
@@ -496,9 +494,6 @@ def _oauth_app_uses_vault(info: OAuthClientInfo) -> bool:
     return any(
         [
             info.client_credentials_secret_ocid,
-            info.private_key_secret_ocid,
-            info.private_key_passphrase_secret_ocid,
-            info.certificate_secret_ocid,
         ]
     )
 
