@@ -29,6 +29,7 @@ from ._authorization import (
 from ._errors import CallerAssertionValidationError, OAuthClientResolutionError
 from ._factory_support import (
     ConfigurationError,
+    KmsJwtSigner,
     LOGGER,
     OCI_IDENTITY_AUDIENCE,
     SUPPORTED_TOKEN_TYPES,
@@ -143,7 +144,7 @@ class TokenResultCache:
 class TokenFactory:
     """Exchanges caller or OCI credentials for documented downstream token shapes."""
 
-    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = TokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer, token_cache_enabled: Optional[bool] = None, token_cache: Optional[TokenResultCache] = None, token_cache_skew_seconds: int = 5, token_cache_max_size: Optional[int] = None):
+    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = TokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer, jwt_assertion_signer: Any = None, token_cache_enabled: Optional[bool] = None, token_cache: Optional[TokenResultCache] = None, token_cache_skew_seconds: int = 5, token_cache_max_size: Optional[int] = None):
         """Configure runtime settings, OAuth client resolution, authorization, and exchange clients."""
         if config_overrides is not None and not isinstance(config_overrides, dict):
             raise TypeError("TokenFactory expects no positional argument or a config overrides dict.")
@@ -171,6 +172,7 @@ class TokenFactory:
         self._db_token_generator = db_token_generator
         self._factory_oci_signer_builder = factory_oci_signer_builder
         self._oci_signer_builder = oci_signer_builder
+        self._jwt_assertion_signer = jwt_assertion_signer
         self._token_cache_enabled = runtime_config.cache_enable if token_cache_enabled is None else bool(token_cache_enabled)
         resolved_cache_max_size = runtime_config.cache_max_size if token_cache_max_size is None else token_cache_max_size
         self._token_cache = token_cache or TokenResultCache(resolved_cache_max_size)
@@ -317,7 +319,7 @@ class TokenFactory:
         return self._token_cache.set(cache_key, result, expires_at_epoch, int(time.time()), self._token_cache_skew_seconds)
 
     def _validate_assertion(self, credential: str, client_key: str) -> CallerContext:
-        hosting_component = self._resolve_hosting_component(client_key)
+        hosting_component = self._resolve_hosting_component(client_key, require_signing_material=self._jwt_assertion_signer is None)
         validated = self._get_token_validator().validate(credential, hosting_component)
         subject = validated.claims.get(self._runtime_config.subject_claim)
         if not subject:
@@ -361,7 +363,9 @@ class TokenFactory:
 
     def _build_jwt_assertion(self, subject: str, hosting_component: ResolvedHostingComponent, token_type: str) -> str:
         identity = hosting_component.oauth_identity
-        issuer, private_key_pem = _require_signing_identity(identity, hosting_component.client_key)
+        if not identity.issuer:
+            raise OAuthClientResolutionError(f"OAuth client '{hosting_component.client_key}' is missing issuer.")
+        issuer = identity.issuer
         now = int(time.time())
         payload = {
             "iss": issuer,
@@ -372,10 +376,15 @@ class TokenFactory:
             "jti": str(uuid.uuid4()),
         }
         payload.update(_propagation_trust_claim(hosting_component, token_type))
-        headers = {"typ": "JWT"}
+        headers = {"alg": "RS256", "typ": "JWT"}
         if identity.kid:
             headers["kid"] = identity.kid
 
+        if self._jwt_assertion_signer is not None:
+            return _sign_compact_jws(headers, payload, self._jwt_assertion_signer)
+        if identity.kms_key_id and identity.kms_key_version_id and identity.kms_crypto_endpoint:
+            return _sign_compact_jws(headers, payload, KmsJwtSigner(identity.kms_key_id, identity.kms_key_version_id, identity.kms_crypto_endpoint, self._factory_oci_signer_builder, self._runtime_config))
+        _, private_key_pem = _require_signing_identity(identity, hosting_component.client_key)
         key = _load_private_key(private_key_pem, identity.private_key_passphrase)
         return jwt.encode(payload, key=key, algorithm="RS256", headers=headers)
 
@@ -658,6 +667,25 @@ def _copy_cached_result(result: Any) -> Any:
 def _cache_key(*parts: Any) -> str:
     """Build a deterministic cache key from non-secret or pre-fingerprinted parts."""
     return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
+
+def _sign_compact_jws(headers: Dict[str, Any], payload: Dict[str, Any], signer: Any) -> str:
+    """Build an RS256 compact JWS with a signature produced outside the process."""
+    encoded_header = _base64url_json(headers)
+    encoded_payload = _base64url_json(payload)
+    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
+    signature = signer.sign(signing_input)
+    if not isinstance(signature, bytes):
+        raise TokenExchangeError("JWT signer must return signature bytes.")
+    return f"{encoded_header}.{encoded_payload}.{_base64url(signature)}"
+
+
+def _base64url_json(value: Dict[str, Any]) -> str:
+    return _base64url(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 def _cache_key_hint(key: str) -> str:

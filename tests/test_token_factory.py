@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
+import json
 import os
 from pathlib import Path
 import sys
@@ -205,11 +207,21 @@ class FakeTokenValidator:
         )
 
 
+class RecordingJwtSigner:
+    def __init__(self):
+        self.signing_inputs = []
+
+    def sign(self, signing_input):
+        self.signing_inputs.append(signing_input)
+        return b"kms-signature"
+
+
 def oauth_apps(**overrides):
     info = {
         "client_credentials": "client-id:client-secret",
         "issuer": "https://issuer.example.com/",
         "private_key_pem": PRIVATE_KEY,
+        "kid": "orders-kid",
         "resource_audiences": ["https://orders.example.com/"],
     }
     info.update(overrides)
@@ -282,6 +294,25 @@ class TokenFactorySimplificationTests(unittest.TestCase):
         request = session.calls[0][1]
         self.assertEqual(request["data"]["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer")
         self.assertEqual(request["data"]["assertion"], "signed.assertion")
+
+    def test_assertion_backed_oauth_uses_injected_kms_jwt_signer(self):
+        session = FakeTokenEndpointSession()
+        kms_signer = RecordingJwtSigner()
+        factory = TokenFactory(
+            runtime_config=runtime_config(),
+            oauth_apps=oauth_apps(private_key_pem=None),
+            token_endpoint_session=session,
+            token_validator=FakeTokenValidator(incoming_scopes=["other"]),
+            jwt_assertion_signer=kms_signer,
+        )
+
+        factory.get_token("caller.jwt", "oauth", "orders.read", client_key="orders")
+
+        assertion = session.calls[0][1]["data"]["assertion"]
+        header, payload, signature = assertion.split(".")
+        self.assertEqual(kms_signer.signing_inputs, [f"{header}.{payload}".encode("ascii")])
+        self.assertEqual(json.loads(base64.urlsafe_b64decode(header + "==")), {"alg": "RS256", "kid": "orders-kid", "typ": "JWT"})
+        self.assertEqual(signature, base64.urlsafe_b64encode(b"kms-signature").rstrip(b"=").decode("ascii"))
 
     def test_userid_returns_validated_subject(self):
         factory = TokenFactory(

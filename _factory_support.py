@@ -53,6 +53,29 @@ class TokenExchangeError(RuntimeError):
     """Raised when upstream token exchange or database token issuance fails."""
 
 
+class KmsJwtSigner:
+    """Signs compact-JWS inputs through an OCI KMS asymmetric key."""
+
+    def __init__(self, key_id: str, key_version_id: str, crypto_endpoint: str, factory_signer_builder: Any, runtime_config: Any):
+        self._key_id = key_id
+        self._key_version_id = key_version_id
+        self._crypto_endpoint = crypto_endpoint
+        self._factory_signer_builder = factory_signer_builder
+        self._runtime_config = runtime_config
+
+    def sign(self, signing_input: bytes) -> bytes:
+        from oci.key_management import KmsCryptoClient
+        from oci.key_management.models import SignDataDetails
+
+        client = KmsCryptoClient(config={"region": self._runtime_config.oci_region}, service_endpoint=self._crypto_endpoint, signer=self._factory_signer_builder(self._runtime_config))
+        details = SignDataDetails(message=base64.b64encode(signing_input).decode("ascii"), message_type="RAW", key_id=self._key_id, key_version_id=self._key_version_id, signing_algorithm="SHA_256_RSA_PKCS1_V1_5")
+        response = client.sign(details)
+        try:
+            return base64.b64decode(response.data.signature)
+        except Exception as exc:
+            raise TokenExchangeError(f"OCI KMS returned an invalid JWT signature: {exc}") from exc
+
+
 SUPPORTED_TOKEN_TYPES = (
     "oracle-database",
     "oci-service",

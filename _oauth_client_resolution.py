@@ -23,6 +23,9 @@ class OAuthClientInfo:
     certificate_path: Optional[str] = None
     certificate_secret_ocid: Optional[str] = None
     kid: Optional[str] = None
+    kms_key_id: Optional[str] = None
+    kms_key_version_id: Optional[str] = None
+    kms_crypto_endpoint: Optional[str] = None
     propagation_trust_claim: Optional[str] = None
     resource_audiences: List[str] = field(default_factory=list)
     required_incoming_scopes: List[str] = field(default_factory=list)
@@ -37,6 +40,9 @@ class OAuthClientIdentity:
     certificate_pem: Optional[str] = None
     kid: Optional[str] = None
     private_key_passphrase: Optional[str] = None
+    kms_key_id: Optional[str] = None
+    kms_key_version_id: Optional[str] = None
+    kms_crypto_endpoint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +123,9 @@ class StaticOAuthClientResolver(OAuthClientResolver):
                 certificate_pem=certificate_pem,
                 kid=info.kid,
                 private_key_passphrase=private_key_passphrase,
+                kms_key_id=info.kms_key_id,
+                kms_key_version_id=info.kms_key_version_id,
+                kms_crypto_endpoint=info.kms_crypto_endpoint,
             ),
             resource_audiences=list(info.resource_audiences),
             propagation_trust_claim=info.propagation_trust_claim,
