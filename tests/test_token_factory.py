@@ -227,7 +227,9 @@ def oauth_apps(**overrides):
     info = {
         "client_credentials": "client-id:client-secret",
         "issuer": "https://issuer.example.com/",
-        "kms_key_id": "ocid1.key.oc1..signing-key",`r`n        "kms_key_version_id": "ocid1.keyversion.oc1..signing-key-version",`r`n        "kms_crypto_endpoint": "https://kms.example.com"
+        "kms_key_id": "ocid1.key.oc1..signing-key",
+        "kms_key_version_id": "ocid1.keyversion.oc1..signing-key-version",
+        "kms_crypto_endpoint": "https://kms.example.com",
         "kid": "orders-kid",
         "resource_audiences": ["https://orders.example.com/"],
     }
@@ -250,7 +252,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
         session = FakeTokenEndpointSession()
         factory = TokenFactory(
             runtime_config=runtime_config(),
-            oauth_apps=oauth_apps(, issuer=None),
+            oauth_apps=oauth_apps( issuer=None),
             token_endpoint_session=session,
             token_validation_session=DiscoveryFailingSession(),
         )
@@ -496,7 +498,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_cache_disabled_by_default_does_not_reuse_client_credentials_token(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session)
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session)
 
         factory.get_token(None, "oauth", "database-scope", client_key="orders")
         factory.get_token(None, "oauth", "database-scope", client_key="orders")
@@ -505,7 +507,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_constructor_override_can_enable_client_credentials_cache(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=False), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session, token_cache_enabled=True)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=False), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session, token_cache_enabled=True)
 
         first = factory.get_token(None, "oauth", "database-scope", client_key="orders")
         second = factory.get_token(None, "oauth", "database-scope", client_key="orders")
@@ -516,7 +518,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_constructor_override_can_disable_runtime_cache(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session, token_cache_enabled=False)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session, token_cache_enabled=False)
 
         factory.get_token(None, "oauth", "database-scope", client_key="orders")
         factory.get_token(None, "oauth", "database-scope", client_key="orders")
@@ -538,7 +540,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_expired_oauth_cache_entry_triggers_new_exchange(self):
         session = FakeTokenEndpointSession(FakeResponse({"access_token": "issued-token", "token_type": "Bearer", "expires_in": 1}))
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session)
 
         factory.get_token(None, "oauth", "database-scope", client_key="orders")
         factory.get_token(None, "oauth", "database-scope", client_key="orders")
@@ -547,7 +549,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_cache_key_separates_scope(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session)
 
         factory.get_token(None, "oauth", "database-scope-a", client_key="orders")
         factory.get_token(None, "oauth", "database-scope-b", client_key="orders")
@@ -556,7 +558,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_cached_dict_mutation_does_not_poison_cache(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session)
 
         first = factory.get_token(None, "oauth", "database-scope", client_key="orders")
         first["access_token"] = "mutated"
@@ -567,7 +569,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_cache_logs_miss_and_hit(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session)
 
         with self.assertLogs("token_factory", level="INFO") as logs:
             factory.get_token(None, "oauth", "database-scope", client_key="orders")
@@ -579,7 +581,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_cache_evicts_least_recently_used_entry_when_max_size_is_reached(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=2), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=2), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session)
 
         factory.get_token(None, "oauth", "scope-a", client_key="orders")
         factory.get_token(None, "oauth", "scope-b", client_key="orders")
@@ -591,7 +593,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_cache_eviction_is_logged(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=1), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=1), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session)
 
         with self.assertLogs("token_factory", level="INFO") as logs:
             factory.get_token(None, "oauth", "scope-a", client_key="orders")
@@ -601,7 +603,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
     def test_constructor_override_can_set_cache_max_size(self):
         session = FakeTokenEndpointSession()
-        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=10), oauth_apps=oauth_apps(, issuer=None), token_endpoint_session=session, token_cache_max_size=1)
+        factory = TokenFactory(runtime_config=runtime_config(cache_enable=True, cache_max_size=10), oauth_apps=oauth_apps( issuer=None), token_endpoint_session=session, token_cache_max_size=1)
 
         factory.get_token(None, "oauth", "scope-a", client_key="orders")
         factory.get_token(None, "oauth", "scope-b", client_key="orders")
