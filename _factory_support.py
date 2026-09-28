@@ -55,6 +55,40 @@ class TokenExchangeError(RuntimeError):
     """Raised when upstream token exchange or database token issuance fails."""
 
 
+class DiscoveredTokenExchangeSigner(TokenExchangeSigner):
+    """OCI security-token signer that exchanges assertions at one discovered endpoint."""
+
+    def __init__(self, jwt_or_func: Any, token_endpoint: str, client_id: str, client_secret: str, region: Optional[str] = None, **kwargs: Any):
+        self.token_endpoint = token_endpoint
+        super().__init__(jwt_or_func, token_endpoint, client_id, client_secret, region=region, **kwargs)
+
+    def _get_new_token(self) -> str:
+        jwt_assertion = self._get_jwt()
+        public_key_pem = self.session_key_supplier.private_key.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode("utf-8")
+        public_key_value = public_key_pem.replace("\n", "").replace("-----BEGIN PUBLIC KEY-----", "").replace("-----END PUBLIC KEY-----", "")
+        encoded_auth = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode("utf-8")).decode("utf-8")
+        response = self.requests_session.post(
+            self.token_endpoint,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Authorization": f"Basic {encoded_auth}"},
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "requested_token_type": "urn:oci:token-type:oci-upst",
+                "subject_token": jwt_assertion,
+                "subject_token_type": "jwt",
+                "public_key": public_key_value,
+            },
+            allow_redirects=False,
+        )
+        status_code = getattr(response, "status_code", None)
+        if not isinstance(status_code, int) or status_code < 200 or status_code >= 300:
+            raise TokenExchangeError(f"Identity propagation token exchange failed with status {status_code if status_code is not None else 'unknown'}.")
+        payload = response.json()
+        token = payload.get("token") if isinstance(payload, dict) else None
+        if not token:
+            raise TokenExchangeError("Identity propagation token exchange response missing token.")
+        return str(token)
+
+
 class KmsJwtSigner:
     """Signs compact-JWS inputs through an OCI KMS asymmetric key."""
 

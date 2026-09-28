@@ -244,7 +244,7 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
         factory = TokenFactory(runtime_config=runtime_config(timeout_seconds=17), oauth_apps=oauth_apps(), token_validation_session=discovery_session)
 
-        self.assertEqual(discovery_session.calls, [("https://idcs-example.identity.oraclecloud.com/.well-known/openid-configuration", {"timeout": 17})])
+        self.assertEqual(discovery_session.calls, [("https://idcs-example.identity.oraclecloud.com/.well-known/openid-configuration", {"timeout": 17, "allow_redirects": False})])
         self.assertEqual(factory._identity_domain_metadata.token_endpoint, "https://oauth.example.net/custom/token")
 
     def test_custom_token_validator_still_discovers_once(self):
@@ -349,6 +349,49 @@ class TokenFactorySimplificationTests(unittest.TestCase):
         payload_segment = assertion.split(".")[1]
         payload = json.loads(base64.urlsafe_b64decode(payload_segment + "=" * (-len(payload_segment) % 4)))
         self.assertEqual(payload["aud"], "https://oauth.example.net/custom/token")
+        self.assertEqual(exchange_signer.args[1], "https://oauth.example.net/custom/token")
+
+    def test_identity_propagation_signer_posts_to_exact_discovered_endpoint(self):
+        factory_support = sys.modules["token_factory._factory_support"]
+        signer_type = getattr(factory_support, "DiscoveredTokenExchangeSigner")
+        calls = []
+
+        class PublicKey:
+            def public_bytes(self, **_kwargs):
+                return b"public-key"
+
+        class PrivateKey:
+            def public_key(self):
+                return PublicKey()
+
+        class Response:
+            status_code = 200
+            url = "https://oauth.example.net/custom/token"
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"token": "upst-token"}
+
+        class Session:
+            def post(self, url, **kwargs):
+                calls.append((url, kwargs))
+                return Response()
+
+        signer = object.__new__(signer_type)
+        signer._get_jwt = lambda: "hosting-assertion"
+        signer.client_id = "client-id"
+        signer.client_secret = "client-secret"
+        signer.token_endpoint = "https://oauth.example.net/custom/token"
+        signer.session_key_supplier = types.SimpleNamespace(private_key=PrivateKey())
+        signer.requests_session = Session()
+
+        token = signer._get_new_token()
+
+        self.assertEqual(token, "upst-token")
+        self.assertEqual(calls[0][0], "https://oauth.example.net/custom/token")
+        self.assertEqual(calls[0][1]["allow_redirects"], False)
 
     def test_app_assertion_issuer_remains_explicit(self):
         session = FakeTokenEndpointSession()

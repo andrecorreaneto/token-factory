@@ -2,6 +2,7 @@ import importlib.util
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 import sys
+import traceback
 import types
 import unittest
 
@@ -69,7 +70,7 @@ class IdentityDomainDiscoveryTests(unittest.TestCase):
 
                 metadata = discover_identity_domain_metadata(domain_url, 17, session)
 
-                self.assertEqual(session.calls, [("https://idcs.example.com/.well-known/openid-configuration", {"timeout": 17})])
+                self.assertEqual(session.calls, [("https://idcs.example.com/.well-known/openid-configuration", {"timeout": 17, "allow_redirects": False})])
                 self.assertEqual(metadata.issuer, "https://identity.oraclecloud.com/")
                 self.assertEqual(metadata.jwks_uri, "https://idcs.example.com/admin/v1/SigningCert/jwk")
                 self.assertEqual(metadata.token_endpoint, "https://idcs.example.com/oauth2/v1/token")
@@ -83,6 +84,7 @@ class IdentityDomainDiscoveryTests(unittest.TestCase):
 
         self.assertIn("https://idcs.example.com/.well-known/openid-configuration", str(raised.exception))
         self.assertNotIn("network-detail-must-not-leak", str(raised.exception))
+        self.assertNotIn("network-detail-must-not-leak", "".join(traceback.format_exception(raised.exception)))
 
     def test_rejects_unsuccessful_response_without_response_content(self):
         session = DiscoverySession(DiscoveryResponse({}, ok=False, status_code=503, text="response-body-must-not-leak"))
@@ -99,6 +101,15 @@ class IdentityDomainDiscoveryTests(unittest.TestCase):
             discover_identity_domain_metadata("https://idcs.example.com", 17, session)
 
         self.assertNotIn("parser-detail-must-not-leak", str(raised.exception))
+        self.assertNotIn("parser-detail-must-not-leak", "".join(traceback.format_exception(raised.exception)))
+
+    def test_rejects_redirect_response(self):
+        session = DiscoverySession(DiscoveryResponse(valid_metadata(), ok=True, status_code=302))
+
+        with self.assertRaisesRegex(RuntimeError, "status 302"):
+            discover_identity_domain_metadata("https://idcs.example.com", 17, session)
+
+        self.assertEqual(session.calls[0][1]["allow_redirects"], False)
 
     def test_rejects_non_object_json(self):
         for payload in ([], "metadata", 1, None):
@@ -151,6 +162,24 @@ class IdentityDomainDiscoveryTests(unittest.TestCase):
                     session = DiscoverySession(DiscoveryResponse(payload))
                     with self.assertRaisesRegex(RuntimeError, field_name):
                         discover_identity_domain_metadata("https://idcs.example.com", 17, session)
+
+    def test_rejects_empty_delimiters_invalid_ports_and_malformed_urls(self):
+        for domain_url in ("https://idcs.example.com?", "https://idcs.example.com#", "https://idcs.example.com:invalid", "https://user:secret@[invalid"):
+            with self.subTest(domain_url=domain_url):
+                session = DiscoverySession(DiscoveryResponse(valid_metadata()))
+                try:
+                    discover_identity_domain_metadata(domain_url, 17, session)
+                except RuntimeError as exc:
+                    rendered = "".join(traceback.format_exception(exc))
+                    self.assertNotIn("user:secret", rendered)
+                else:
+                    self.fail("Expected unsafe identity_domain_url to be rejected")
+                self.assertEqual(session.calls, [])
+
+        payload = valid_metadata()
+        payload["token_endpoint"] = "https://idcs.example.com:invalid/token"
+        with self.assertRaisesRegex(RuntimeError, "token_endpoint"):
+            discover_identity_domain_metadata("https://idcs.example.com", 17, DiscoverySession(DiscoveryResponse(payload)))
 
 
 if __name__ == "__main__":

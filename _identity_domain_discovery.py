@@ -19,18 +19,19 @@ class IdentityDomainMetadata:
 
 def discover_identity_domain_metadata(domain_url: str, timeout_seconds: int, session: Any = requests) -> IdentityDomainMetadata:
     """Load the required Identity Domain metadata from OIDC discovery."""
-    normalized_domain_url = _validated_https_url(domain_url.rstrip("/"), "identity_domain_url")
+    normalized_domain_url = _validated_https_url(str(domain_url or "").strip().rstrip("/"), "identity_domain_url")
     discovery_url = f"{normalized_domain_url}/.well-known/openid-configuration"
     try:
-        response = session.get(discovery_url, timeout=timeout_seconds)
-    except Exception as exc:
-        raise ConfigurationError(f"OIDC discovery request failed for '{discovery_url}'.") from exc
-    if not getattr(response, "ok", True):
-        raise ConfigurationError(f"OIDC discovery request failed for '{discovery_url}' with status {getattr(response, 'status_code', 'unknown')}.")
+        response = session.get(discovery_url, timeout=timeout_seconds, allow_redirects=False)
+    except Exception:
+        raise ConfigurationError(f"OIDC discovery request failed for '{discovery_url}'.") from None
+    status_code = getattr(response, "status_code", None)
+    if not isinstance(status_code, int) or status_code < 200 or status_code >= 300:
+        raise ConfigurationError(f"OIDC discovery request failed for '{discovery_url}' with status {status_code if status_code is not None else 'unknown'}.")
     try:
         payload = response.json()
-    except Exception as exc:
-        raise ConfigurationError(f"OIDC discovery response from '{discovery_url}' contains invalid JSON.") from exc
+    except Exception:
+        raise ConfigurationError(f"OIDC discovery response from '{discovery_url}' contains invalid JSON.") from None
     if not isinstance(payload, dict):
         raise ConfigurationError(f"OIDC discovery response from '{discovery_url}' must be a JSON object.")
     return IdentityDomainMetadata(
@@ -52,7 +53,16 @@ def _validated_metadata_url(payload: dict, field_name: str) -> str:
 def _validated_https_url(value: str, label: str) -> str:
     """Require an absolute HTTPS URL without credentials, query, or fragment."""
     candidate = str(value or "").strip()
-    parsed = urlsplit(candidate)
-    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+    if "?" in candidate or "#" in candidate:
+        raise ConfigurationError(f"{label} must be an absolute HTTPS URL without credentials, query, or fragment.")
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        username = parsed.username
+        password = parsed.password
+        parsed.port
+    except (TypeError, ValueError, UnicodeError):
+        raise ConfigurationError(f"{label} must be an absolute HTTPS URL without credentials, query, or fragment.") from None
+    if parsed.scheme.lower() != "https" or not hostname or username is not None or password is not None:
         raise ConfigurationError(f"{label} must be an absolute HTTPS URL without credentials, query, or fragment.")
     return candidate

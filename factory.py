@@ -15,8 +15,6 @@ import jwt
 import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from oci.auth.signers import TokenExchangeSigner
-
 from ._authorization import (
     AuthorizationPolicyProvider,
     AuthorizationRequest,
@@ -29,12 +27,12 @@ from ._errors import CallerAssertionValidationError, OAuthClientResolutionError
 from ._identity_domain_discovery import IdentityDomainMetadata, discover_identity_domain_metadata
 from ._factory_support import (
     ConfigurationError,
+    DiscoveredTokenExchangeSigner,
     KmsJwtSigner,
     LOGGER,
     OCI_IDENTITY_AUDIENCE,
     SUPPORTED_TOKEN_TYPES,
     TokenExchangeError,
-    _extract_identity_domain_id,
     _extract_token_exchange_signer_keypair_pem,
     _fetch_secret_value_from_oci,
     _generate_db_token_with_dataplane,
@@ -144,7 +142,7 @@ class TokenResultCache:
 class TokenFactory:
     """Exchanges caller or OCI credentials for documented downstream token shapes."""
 
-    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = TokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer, jwt_assertion_signer: Any = None, token_cache_enabled: Optional[bool] = None, token_cache: Optional[TokenResultCache] = None, token_cache_skew_seconds: int = 5, token_cache_max_size: Optional[int] = None):
+    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = DiscoveredTokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer, jwt_assertion_signer: Any = None, token_cache_enabled: Optional[bool] = None, token_cache: Optional[TokenResultCache] = None, token_cache_skew_seconds: int = 5, token_cache_max_size: Optional[int] = None):
         """Configure runtime settings, OAuth client resolution, authorization, and exchange clients."""
         if config_overrides is not None and not isinstance(config_overrides, dict):
             raise TypeError("TokenFactory expects no positional argument or a config overrides dict.")
@@ -447,10 +445,9 @@ class TokenFactory:
 
     def _build_upst_signer(self, assertion: str, hosting_component: ResolvedHostingComponent) -> Any:
         identity = hosting_component.oauth_identity
-        domain_id = _extract_identity_domain_id(self._runtime_config.domain_url)
         return self._token_exchange_signer_cls(
             assertion,
-            domain_id,
+            self._identity_domain_metadata.token_endpoint,
             identity.client_id,
             identity.client_secret,
             region=self._runtime_config.domain_region,
