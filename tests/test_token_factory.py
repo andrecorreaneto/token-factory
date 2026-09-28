@@ -21,16 +21,25 @@ class _FakeJwt(types.ModuleType):
         return "signed.assertion"
 
 
+def discovery_metadata(*, token_endpoint="https://oauth.example.net/custom/token", introspection_endpoint="https://oauth.example.net/custom/introspection"):
+    return {
+        "issuer": "https://identity.oraclecloud.com/",
+        "jwks_uri": "https://idcs.example.com/admin/v1/SigningCert/jwk",
+        "token_endpoint": token_endpoint,
+        "introspection_endpoint": introspection_endpoint,
+    }
+
+
 class _FakeDiscoveryResponse:
     ok = True
     status_code = 200
     text = "{}"
 
+    def __init__(self, payload=None):
+        self.payload = payload or discovery_metadata()
+
     def json(self):
-        return {
-            "issuer": "https://issuer.example.com/",
-            "jwks_uri": "https://issuer.example.com/jwks",
-        }
+        return dict(self.payload)
 
 
 class _FakePublicKey:
@@ -165,6 +174,20 @@ class DiscoveryFailingSession:
         raise AssertionError("OIDC discovery should not run")
 
 
+class RecordingDiscoverySession:
+    def __init__(self, payloads=None, error=None):
+        self.payloads = list(payloads or [discovery_metadata()])
+        self.error = error
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.error:
+            raise self.error
+        index = min(len(self.calls) - 1, len(self.payloads) - 1)
+        return _FakeDiscoveryResponse(self.payloads[index])
+
+
 class FakeTokenValidator:
     def __init__(self, *, claims=None, incoming_scopes=None, audience=None):
         self.calls = []
@@ -216,6 +239,42 @@ def runtime_config(**overrides):
 
 
 class TokenFactorySimplificationTests(unittest.TestCase):
+    def test_constructor_discovers_identity_domain_metadata_once(self):
+        discovery_session = RecordingDiscoverySession()
+
+        factory = TokenFactory(runtime_config=runtime_config(timeout_seconds=17), oauth_apps=oauth_apps(), token_validation_session=discovery_session)
+
+        self.assertEqual(discovery_session.calls, [("https://idcs-example.identity.oraclecloud.com/.well-known/openid-configuration", {"timeout": 17})])
+        self.assertEqual(factory._identity_domain_metadata.token_endpoint, "https://oauth.example.net/custom/token")
+
+    def test_custom_token_validator_still_discovers_once(self):
+        discovery_session = RecordingDiscoverySession()
+
+        TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(), token_validation_session=discovery_session, token_validator=FakeTokenValidator())
+
+        self.assertEqual(len(discovery_session.calls), 1)
+
+    def test_factory_reuses_immutable_discovery_snapshot(self):
+        discovery_session = RecordingDiscoverySession([
+            discovery_metadata(token_endpoint="https://oauth.example.net/first/token"),
+            discovery_metadata(token_endpoint="https://oauth.example.net/second/token"),
+        ])
+        token_session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(issuer=None), token_endpoint_session=token_session, token_validation_session=discovery_session, token_validator=FakeTokenValidator(), oci_signer_builder=lambda _credential: "oci-signer")
+        credential = {"tenancy": "tenancy", "user": "user", "fingerprint": "fingerprint", "region": "us-ashburn-1", "private_key_content": "key"}
+
+        factory.get_token(None, "oauth", "orders.read", client_key="orders")
+        factory.get_token_with_oci_credential(credential, scope="orders.read")
+
+        self.assertEqual(len(discovery_session.calls), 1)
+        self.assertEqual([call[0] for call in token_session.calls], ["https://oauth.example.net/first/token", "https://oauth.example.net/first/token"])
+
+    def test_constructor_propagates_discovery_configuration_error(self):
+        discovery_session = RecordingDiscoverySession(error=RuntimeError("unreachable"))
+
+        with self.assertRaisesRegex(ConfigurationError, "OIDC discovery request failed"):
+            TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(), token_validation_session=discovery_session)
+
     def test_kms_jwt_signer_sends_sha256_digest_for_long_signing_input(self):
         captured_details = []
 
@@ -236,13 +295,14 @@ class TokenFactorySimplificationTests(unittest.TestCase):
         self.assertEqual(captured_details[0].message_type, "DIGEST")
         self.assertEqual(base64.b64decode(captured_details[0].message), hashlib.sha256(signing_input).digest())
 
-    def test_oauth_client_credentials_skips_discovery_and_private_key_resolution(self):
+    def test_oauth_client_credentials_discovers_but_skips_private_key_resolution(self):
         session = FakeTokenEndpointSession()
+        discovery_session = RecordingDiscoverySession()
         factory = TokenFactory(
             runtime_config=runtime_config(),
             oauth_apps=oauth_apps( issuer=None),
             token_endpoint_session=session,
-            token_validation_session=DiscoveryFailingSession(),
+            token_validation_session=discovery_session,
         )
 
         result = factory.get_token(None, "oauth", "database-scope", client_key="orders")
@@ -252,6 +312,62 @@ class TokenFactorySimplificationTests(unittest.TestCase):
         self.assertEqual(session.calls[0][1]["data"]["grant_type"], "client_credentials")
         self.assertEqual(session.calls[0][1]["data"]["scope"], "database-scope")
         self.assertNotIn("assertion", session.calls[0][1]["data"])
+        self.assertEqual(len(discovery_session.calls), 1)
+
+    def test_client_credentials_uses_discovered_token_endpoint(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(issuer=None), token_endpoint_session=session, token_validation_session=RecordingDiscoverySession())
+
+        factory.get_token(None, "oauth", "orders.read", client_key="orders")
+
+        self.assertEqual(session.calls[0][0], "https://oauth.example.net/custom/token")
+
+    def test_jwt_bearer_uses_discovered_token_endpoint(self):
+        session = FakeTokenEndpointSession()
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(), token_endpoint_session=session, token_validation_session=RecordingDiscoverySession(), token_validator=FakeTokenValidator(incoming_scopes=["other"]))
+
+        factory.get_token("caller.jwt", "oauth", "orders.read", client_key="orders")
+
+        self.assertEqual(session.calls[0][0], "https://oauth.example.net/custom/token")
+
+    def test_oci_credential_uses_discovered_token_endpoint(self):
+        session = FakeTokenEndpointSession()
+        credential = {"tenancy": "tenancy", "user": "user", "fingerprint": "fingerprint", "region": "us-ashburn-1", "private_key_content": "key"}
+        factory = TokenFactory(runtime_config=runtime_config(), token_endpoint_session=session, token_validation_session=RecordingDiscoverySession(), oci_signer_builder=lambda _credential: "oci-signer")
+
+        factory.get_token_with_oci_credential(credential, scope="orders.read")
+
+        self.assertEqual(session.calls[0][0], "https://oauth.example.net/custom/token")
+
+    def test_identity_propagation_uses_discovered_token_endpoint(self):
+        kms_signer = RecordingJwtSigner()
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(), token_validation_session=RecordingDiscoverySession(), token_validator=FakeTokenValidator(), token_exchange_signer_cls=_FakeTokenExchangeSigner, jwt_assertion_signer=kms_signer)
+
+        exchange_signer = factory.get_token("caller.jwt", "oci-service", client_key="orders")
+
+        assertion = exchange_signer.args[0]
+        payload_segment = assertion.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(payload_segment + "=" * (-len(payload_segment) % 4)))
+        self.assertEqual(payload["aud"], "https://oauth.example.net/custom/token")
+
+    def test_app_assertion_issuer_remains_explicit(self):
+        session = FakeTokenEndpointSession()
+        kms_signer = RecordingJwtSigner()
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps(issuer="https://app.example.com/assertions"), token_endpoint_session=session, token_validation_session=RecordingDiscoverySession(), token_validator=FakeTokenValidator(incoming_scopes=["other"]), jwt_assertion_signer=kms_signer)
+
+        factory.get_token("caller.jwt", "oauth", "orders.read", client_key="orders")
+
+        assertion = session.calls[0][1]["data"]["assertion"]
+        payload_segment = assertion.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(payload_segment + "=" * (-len(payload_segment) % 4)))
+        self.assertEqual(payload["iss"], "https://app.example.com/assertions")
+        self.assertNotEqual(payload["iss"], "https://identity.oraclecloud.com/")
+
+    def test_factory_module_contains_no_hardcoded_token_or_introspection_path(self):
+        source = (Path(__file__).resolve().parents[1] / "factory.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("/oauth2/v1/token", source)
+        self.assertNotIn("/oauth2/v1/introspect", source)
 
     def test_oci_principal_database_token_skips_caller_validation(self):
         calls = []

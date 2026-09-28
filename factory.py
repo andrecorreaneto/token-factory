@@ -26,6 +26,7 @@ from ._authorization import (
     VaultJsonAuthorizationPolicyProvider,
 )
 from ._errors import CallerAssertionValidationError, OAuthClientResolutionError
+from ._identity_domain_discovery import IdentityDomainMetadata, discover_identity_domain_metadata
 from ._factory_support import (
     ConfigurationError,
     KmsJwtSigner,
@@ -156,6 +157,7 @@ class TokenFactory:
             runtime_config = TokenFactoryRuntimeConfig.from_env(config_overrides)
 
         self._runtime_config = runtime_config
+        self._identity_domain_metadata = discover_identity_domain_metadata(runtime_config.domain_url, runtime_config.timeout_seconds, token_validation_session)
         self._authz_policy_enable = runtime_config.authz_policy_enable
         self._oauth_client_resolver = oauth_client_resolver or _resolver_from_oauth_apps(
             oauth_apps,
@@ -207,7 +209,7 @@ class TokenFactory:
 
         signer_credential = self._resolve_oci_credential(credential)
         signer = self._oci_signer_builder(signer_credential)
-        endpoint = f"{self._runtime_config.domain_url}/oauth2/v1/token"
+        endpoint = self._identity_domain_metadata.token_endpoint
         request_data = {
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
@@ -333,8 +335,11 @@ class TokenFactory:
 
     def _get_token_validator(self) -> Any:
         if self._token_validator is None:
+            claim_overrides = [self._runtime_config.groups_claim or "groups"]
             self._token_validator = _default_token_validator(
                 self._runtime_config,
+                claim_overrides,
+                self._identity_domain_metadata,
                 self._token_validation_session,
             )
         return self._token_validator
@@ -368,7 +373,7 @@ class TokenFactory:
         payload = {
             "iss": issuer,
             "sub": subject,
-            "aud": _jwt_audience(self._runtime_config, token_type),
+            "aud": _jwt_audience(self._identity_domain_metadata, token_type),
             "iat": now,
             "exp": now + 300,
             "jti": str(uuid.uuid4()),
@@ -395,7 +400,7 @@ class TokenFactory:
             request_data["scope"] = scope
 
         response = self._token_endpoint_session.post(
-            f"{self._runtime_config.domain_url}/oauth2/v1/token",
+            self._identity_domain_metadata.token_endpoint,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Authorization": f"Basic {credentials}",
@@ -413,7 +418,7 @@ class TokenFactory:
             request_data["scope"] = scope
 
         response = self._token_endpoint_session.post(
-            f"{self._runtime_config.domain_url}/oauth2/v1/token",
+            self._identity_domain_metadata.token_endpoint,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Authorization": f"Basic {credentials}",
@@ -579,11 +584,10 @@ def _default_policy_provider(runtime_config: TokenFactoryRuntimeConfig) -> Autho
     return VaultJsonAuthorizationPolicyProvider(runtime_config.authz_policy_secret_ocid, read_secret)
 
 
-def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, session: Any = requests) -> Any:
-    claim_overrides = [runtime_config.groups_claim or "groups"]
-    trusted_issuers = _discover_jwt_trusted_issuers(runtime_config, claim_overrides, session)
+def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, claim_overrides: list[str], metadata: IdentityDomainMetadata, session: Any = requests) -> Any:
+    trusted_issuers = _trusted_issuers_from_metadata(metadata, claim_overrides)
     return HybridTokenValidator(
-        introspection_endpoint=f"{runtime_config.domain_url}/oauth2/v1/introspect",
+        introspection_endpoint=metadata.introspection_endpoint,
         trusted_issuers=trusted_issuers,
         jwt_claim_overrides=claim_overrides,
         timeout_seconds=runtime_config.timeout_seconds,
@@ -591,27 +595,10 @@ def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, session:
     )
 
 
-def _discover_jwt_trusted_issuers(runtime_config: TokenFactoryRuntimeConfig, required_claims: list[str], session: Any = requests) -> Dict[str, Dict[str, Any]]:
-    discovery_url = f"{runtime_config.domain_url.rstrip('/')}/.well-known/openid-configuration"
-    try:
-        response = session.get(discovery_url, timeout=runtime_config.timeout_seconds)
-        metadata = response.json()
-    except Exception as exc:
-        raise ConfigurationError(f"OIDC discovery failed: {exc}") from exc
-    if not getattr(response, "ok", True):
-        raise ConfigurationError(
-            f"OIDC discovery failed [{getattr(response, 'status_code', 'unknown')}]: {getattr(response, 'text', '')}"
-        )
-    if not isinstance(metadata, dict):
-        raise ConfigurationError("OIDC discovery response must be a JSON object.")
-
-    issuer = str(metadata.get("issuer") or "").strip()
-    jwks_url = str(metadata.get("jwks_uri") or "").strip()
-    if not issuer or not jwks_url:
-        raise ConfigurationError("OIDC discovery response must include issuer and jwks_uri.")
+def _trusted_issuers_from_metadata(metadata: IdentityDomainMetadata, required_claims: list[str]) -> Dict[str, Dict[str, Any]]:
     return {
-        issuer: {
-            "jwks_url": jwks_url,
+        metadata.issuer: {
+            "jwks_url": metadata.jwks_uri,
             "algorithms": ["RS256"],
             "required_claims": required_claims,
         }
@@ -764,9 +751,9 @@ def _resource_audience_for_request_scope(scope: str) -> Optional[str]:
     return None
 
 
-def _jwt_audience(runtime_config: TokenFactoryRuntimeConfig, token_type: str) -> str:
+def _jwt_audience(metadata: IdentityDomainMetadata, token_type: str) -> str:
     if token_type in {"oracle-database", "oci-service"}:
-        return f"{runtime_config.domain_url}/oauth2/v1/token"
+        return metadata.token_endpoint
     return OCI_IDENTITY_AUDIENCE
 
 
