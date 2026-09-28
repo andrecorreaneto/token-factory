@@ -583,7 +583,7 @@ def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, session:
     claim_overrides = [runtime_config.groups_claim or "groups"]
     trusted_issuers = _discover_jwt_trusted_issuers(runtime_config, claim_overrides, session)
     return HybridTokenValidator(
-        domain_url=runtime_config.domain_url,
+        introspection_endpoint=f"{runtime_config.domain_url}/oauth2/v1/introspect",
         trusted_issuers=trusted_issuers,
         jwt_claim_overrides=claim_overrides,
         timeout_seconds=runtime_config.timeout_seconds,

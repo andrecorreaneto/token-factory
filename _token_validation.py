@@ -18,16 +18,15 @@ class ValidatedCallerAssertion:
 
 
 class TokenValidator:
-    def __init__(self, domain_url: str, timeout_seconds: int = 30, session: Any = requests):
-        self._domain_url = domain_url.rstrip("/")
+    def __init__(self, introspection_endpoint: str, timeout_seconds: int = 30, session: Any = requests):
+        self._introspection_endpoint = introspection_endpoint
         self._timeout_seconds = timeout_seconds
         self._session = session
 
     def validate(self, token: str, hosting_component: ResolvedHostingComponent) -> ValidatedCallerAssertion:
-        endpoint = f"{self._domain_url}/oauth2/v1/introspect"
         try:
             response = self._session.post(
-                endpoint,
+                self._introspection_endpoint,
                 data={"token": token},
                 auth=(
                     hosting_component.oauth_identity.client_id,
@@ -97,12 +96,12 @@ class JwtTokenValidator:
 
 
 class HybridTokenValidator:
-    def __init__(self, domain_url: str, trusted_issuers: Dict[str, Dict[str, Any]], jwt_claim_overrides: List[str], timeout_seconds: int = 30, session: Any = requests):
+    def __init__(self, introspection_endpoint: str, trusted_issuers: Dict[str, Dict[str, Any]], jwt_claim_overrides: List[str], timeout_seconds: int = 30, session: Any = requests):
         normalized_overrides = _normalize_claim_names(jwt_claim_overrides)
         if not normalized_overrides:
             raise ValueError("jwt_claim_overrides must contain at least one claim name.")
         self._introspection_validator = TokenValidator(
-            domain_url=domain_url,
+            introspection_endpoint=introspection_endpoint,
             timeout_seconds=timeout_seconds,
             session=session,
         )
