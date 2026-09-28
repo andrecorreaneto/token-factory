@@ -14,7 +14,6 @@ class OAuthClientInfo:
     client_credentials: Optional[str] = None
     client_credentials_secret_ocid: Optional[str] = None
     issuer: Optional[str] = None
-    certificate_pem: Optional[str] = None
     kid: Optional[str] = None
     kms_key_id: Optional[str] = None
     kms_key_version_id: Optional[str] = None
@@ -29,7 +28,6 @@ class OAuthClientIdentity:
     client_id: str
     client_secret: str
     issuer: Optional[str] = None
-    certificate_pem: Optional[str] = None
     kid: Optional[str] = None
     kms_key_id: Optional[str] = None
     kms_key_version_id: Optional[str] = None
@@ -81,7 +79,6 @@ class StaticOAuthClientResolver(OAuthClientResolver):
             ),
             "client credentials",
         )
-        certificate_pem = None
         if require_signing_material and not info.issuer:
             raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
 
@@ -91,7 +88,6 @@ class StaticOAuthClientResolver(OAuthClientResolver):
                 client_id=client_id,
                 client_secret=client_secret,
                 issuer=info.issuer,
-                certificate_pem=certificate_pem,
                 kid=info.kid,
                 kms_key_id=info.kms_key_id,
                 kms_key_version_id=info.kms_key_version_id,

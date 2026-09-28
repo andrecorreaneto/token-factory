@@ -95,7 +95,7 @@ factory.get_token("oracle-database", caller_jwt, db_scope, client_key="MCP_SERVE
 factory.get_token("oracle-database", "OCI_PRINCIPAL", db_scope, client_key="MCP_SERVER")
 ```
 
-`OCI_PRINCIPAL` is case-insensitive. It defaults to `TF_SHARED_OCI_AUTH_MODE=instance-principal`; set `TF_SHARED_OCI_AUTH_MODE=resource-principal` for resource-principal runtimes. `TF_SHARED_OCI_AUTH_MODE=oci-profile` is rejected for this database-token path. The reserved selector `PROCESS` is intentionally not implemented yet and is kept for future RPST process-principal support.
+`OCI_PRINCIPAL` is case-insensitive and uses the factory's configured OCI signer: instance principal, resource principal, OKE workload identity, or OCI profile. The reserved selector `PROCESS` is intentionally not implemented.
 
 Oracle Database results still unpack as `(token, private_key_pem, expires_in, token_type, issued_token_type)`. They also expose `principal_mode` and `expires_at_epoch` attributes for connection-pool lifecycle decisions. Pool keys for OCI-principal database tokens should include the connect target, database token scope, and principal mode, and pools should be retired before `expires_at_epoch`.
 
@@ -306,9 +306,9 @@ The module can load OAuth app credentials, signing material, certificates, and a
 Expected secret contents when Vault-backed sources are used through `oauth_apps` secret OCID fields:
 
 - `client_credentials_secret_ocid`: plain text `client_id:client_secret`
-- `private_key_secret_ocid`: PEM-encoded RSA private key
-- `private_key_passphrase_secret_ocid`: plain text private-key passphrase
-- `certificate_secret_ocid`: PEM-encoded X.509 certificate
+- `kms_key_id`: asymmetric OCI KMS key OCID
+- `kms_key_version_id`: exact key-version OCID matching the registered certificate
+- `kms_crypto_endpoint`: shared Vault cryptographic endpoint
 - `TF_SHARED_AUTHZ_POLICY_SECRET_OCID`: raw policy JSON or signed policy envelope JSON
 
 Notes:
@@ -348,7 +348,7 @@ Notes:
   Add `where target.secret.id = '<secret-ocid>'` to restrict a policy to a specific configured secret.
 
 - Factory-owned OCI SDK clients use Instance Principals by default. `TF_SHARED_OCI_AUTH_MODE=resource-principal` uses Resource Principals directly, and `TF_SHARED_OCI_AUTH_MODE=oci-profile` enables local OCI API-key profile fallback.
-- Vault reads are skipped for any material supplied directly through `OAuthClientInfo`, such as `client_credentials`, `private_key_path`, `private_key_pem`, `certificate_path`, or `certificate_pem`.
+- Hosting assertion signing never loads private-key PEM. `OAuthClientInfo` carries only KMS key/version metadata and the public `kid`.
 
 
 ### Shared runtime environment variables
@@ -403,14 +403,9 @@ Every `get_token(...)` call resolves the hosting OAuth app from the `oauth_apps`
 | `client_credentials` | yes, unless `client_credentials_secret_ocid` is set | Direct `client_id:client_secret`. |
 | `client_credentials_secret_ocid` | yes, unless `client_credentials` is set | Vault secret containing `client_id:client_secret`. |
 | `issuer` | yes for assertion-backed flows | JWT `iss` used when signing assertions for this hosting app. |
-| `private_key_pem` | one key source required for assertion-backed flows | Direct private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
-| `private_key_path` | one key source required for assertion-backed flows | Local private key path. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
-| `private_key_secret_ocid` | one key source required for assertion-backed flows | Vault secret containing private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
-| `private_key_passphrase` | optional | Direct private-key passphrase. |
-| `private_key_passphrase_secret_ocid` | optional | Vault secret containing the passphrase. |
-| `certificate_pem` | optional in resolver, required by Identity Domain setup | Direct certificate PEM matching the private key. |
-| `certificate_path` | optional | Local certificate path. |
-| `certificate_secret_ocid` | optional | Vault secret containing certificate PEM. |
+| `kms_key_id` | yes for assertion-backed flows | Asymmetric OCI KMS signing-key OCID. |
+| `kms_key_version_id` | yes for assertion-backed flows | Exact key-version OCID bound to the registered public certificate. |
+| `kms_crypto_endpoint` | yes for assertion-backed flows | OCI Vault cryptographic endpoint used by KMS Sign. |
 | `kid` | strongly recommended | JWT `kid` header and Identity Domain certificate alias. |
 | `resource_audiences` | yes for real caller-token validation | Accepted incoming caller assertion audiences for this hosting app. |
 | `required_incoming_scopes` | optional | Required scopes that must already be present in the incoming caller assertion. Bootstrap derives this from Terraform `oauth_apps[*].resource_scopes`. |
@@ -427,7 +422,7 @@ Important behavior details:
 - `get_token_with_oci_credential()` is a separate OAuth token-exchange API for OCI signer dictionaries or OCI CLI profile names. Current code does not validate an end-user assertion and does not run group/scope authorization for that API.
 - `TF_SHARED_CACHE_ENABLE=true` lets a TokenFactory instance reuse unexpired downstream OAuth, Oracle Database, OCI service signer, and OCI-credential OAuth results. Cache keys use request dimensions and credential fingerprints, opaque responses without a reliable expiration are not cached, and `TF_SHARED_CACHE_MAX_SIZE` bounds memory by evicting least recently used entries.
 - Vault-backed OAuth app values require the hosting runtime principal to read the referenced secrets.
-- Direct creds, local key files, and inline PEM/cert values avoid Vault reads for those materials.
+- Direct client credentials avoid a Vault Secret read, but assertion signing still requires OCI KMS.
 - `TF_SHARED_OCI_AUTH_MODE` and `TF_SHARED_OCI_AUTH_PROFILE` apply to factory-owned OCI clients generally, including Vault secret reads.
 
 Hybrid validation notes:
@@ -476,9 +471,9 @@ factory = TokenFactory(
         "orders-api": {
             "client_credentials_secret_ocid": "ocid1.vaultsecret.oc1..<orders-client-credentials>",
             "issuer": "https://orders-api.example.com/token-factory",
-            "private_key_secret_ocid": "ocid1.vaultsecret.oc1..<orders-private-key>",
-            "private_key_passphrase_secret_ocid": None,
-            "certificate_secret_ocid": "ocid1.vaultsecret.oc1..<orders-certificate>",
+            "kms_key_id": "ocid1.key.oc1..<orders-signing-key>",
+            "kms_key_version_id": "ocid1.keyversion.oc1..<orders-signing-key-version>",
+            "kms_crypto_endpoint": "https://<vault>-crypto.kms.us-chicago-1.oraclecloud.com",
             "kid": "orders-api-token-factory-cert",
             "resource_audiences": ["orders-api"],
             "required_incoming_scopes": ["orders-api.invoke"],
@@ -508,8 +503,9 @@ factory = TokenFactory(
         "orders-api": {
             "client_credentials_secret_ocid": "ocid1.vaultsecret.oc1..<orders-client-credentials>",
             "issuer": "https://orders-api.example.com/token-factory",
-            "private_key_secret_ocid": "ocid1.vaultsecret.oc1..<orders-private-key>",
-            "certificate_secret_ocid": "ocid1.vaultsecret.oc1..<orders-certificate>",
+            "kms_key_id": "ocid1.key.oc1..<orders-signing-key>",
+            "kms_key_version_id": "ocid1.keyversion.oc1..<orders-signing-key-version>",
+            "kms_crypto_endpoint": "https://<vault>-crypto.kms.us-chicago-1.oraclecloud.com",
             "kid": "orders-api-token-factory-cert",
             "resource_audiences": ["orders-api"],
             "required_incoming_scopes": ["orders-api.invoke"],

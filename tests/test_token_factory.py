@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,7 @@ def _install_dependency_fakes() -> None:
     signers_module.TokenExchangeSigner = _FakeTokenExchangeSigner
     signers_module.InstancePrincipalsSecurityTokenSigner = lambda: "instance-principal-signer"
     signers_module.get_resource_principals_signer = lambda: "resource-principal-signer"
+    signers_module.get_oke_workload_identity_resource_principal_signer = lambda: "oke-workload-identity-signer"
     sys.modules["oci.auth.signers"] = signers_module
 
     oci_config_module = types.ModuleType("oci.config")
@@ -99,41 +101,6 @@ def _install_dependency_fakes() -> None:
     signer_module.Signer = object
     sys.modules["oci.signer"] = signer_module
 
-    cryptography_module = types.ModuleType("cryptography")
-    cryptography_exceptions_module = types.ModuleType("cryptography.exceptions")
-    cryptography_exceptions_module.InvalidSignature = type("InvalidSignature", (Exception,), {})
-    hazmat_module = types.ModuleType("cryptography.hazmat")
-    primitives_module = types.ModuleType("cryptography.hazmat.primitives")
-    hashes_module = types.ModuleType("cryptography.hazmat.primitives.hashes")
-    hashes_module.SHA256 = lambda: object()
-    serialization_module = types.ModuleType("cryptography.hazmat.primitives.serialization")
-    serialization_module.Encoding = types.SimpleNamespace(PEM="PEM")
-    serialization_module.PublicFormat = types.SimpleNamespace(SubjectPublicKeyInfo="SubjectPublicKeyInfo")
-    serialization_module.PrivateFormat = types.SimpleNamespace(TraditionalOpenSSL="TraditionalOpenSSL")
-    serialization_module.NoEncryption = lambda: object()
-    serialization_module.load_pem_private_key = lambda *_args, **_kwargs: _FakePrivateKey()
-    serialization_module.load_pem_public_key = lambda *_args, **_kwargs: _FakePublicKey()
-    asymmetric_module = types.ModuleType("cryptography.hazmat.primitives.asymmetric")
-    rsa_module = types.ModuleType("cryptography.hazmat.primitives.asymmetric.rsa")
-    rsa_module.generate_private_key = lambda *_args, **_kwargs: _FakePrivateKey()
-    padding_module = types.ModuleType("cryptography.hazmat.primitives.asymmetric.padding")
-    padding_module.MGF1 = lambda *_args, **_kwargs: object()
-    padding_module.PSS = lambda *_args, **_kwargs: object()
-    padding_module.PKCS1v15 = lambda: object()
-    asymmetric_module.rsa = rsa_module
-    backends_module = types.ModuleType("cryptography.hazmat.backends")
-    backends_module.default_backend = lambda: object()
-    sys.modules["cryptography"] = cryptography_module
-    sys.modules["cryptography.exceptions"] = cryptography_exceptions_module
-    sys.modules["cryptography.hazmat"] = hazmat_module
-    sys.modules["cryptography.hazmat.primitives"] = primitives_module
-    sys.modules["cryptography.hazmat.primitives.hashes"] = hashes_module
-    sys.modules["cryptography.hazmat.primitives.serialization"] = serialization_module
-    sys.modules["cryptography.hazmat.primitives.asymmetric"] = asymmetric_module
-    sys.modules["cryptography.hazmat.primitives.asymmetric.rsa"] = rsa_module
-    sys.modules["cryptography.hazmat.primitives.asymmetric.padding"] = padding_module
-    sys.modules["cryptography.hazmat.backends"] = backends_module
-
 
 def _import_package():
     root = Path(__file__).resolve().parents[1]
@@ -163,6 +130,7 @@ from token_factory import (  # noqa: E402
     TokenFactoryRuntimeConfig,
 )
 from token_factory._errors import CallerAssertionValidationError  # noqa: E402
+from token_factory._factory_support import KmsJwtSigner  # noqa: E402
 from token_factory._token_validation import ValidatedCallerAssertion  # noqa: E402
 
 
@@ -248,6 +216,26 @@ def runtime_config(**overrides):
 
 
 class TokenFactorySimplificationTests(unittest.TestCase):
+    def test_kms_jwt_signer_sends_sha256_digest_for_long_signing_input(self):
+        captured_details = []
+
+        class CapturingKmsClient:
+            def sign(self, details):
+                captured_details.append(details)
+                return types.SimpleNamespace(data=types.SimpleNamespace(signature=base64.b64encode(b"kms-signature").decode("ascii")))
+
+        key_management_module = sys.modules["oci.key_management"]
+        signing_input = b"x" * 520
+        runtime = types.SimpleNamespace(oci_region="us-chicago-1")
+        signer = KmsJwtSigner("key-id", "version-id", "https://crypto.example", lambda _runtime: "oci-signer", runtime)
+
+        with patch.object(key_management_module, "KmsCryptoClient", lambda *_args, **_kwargs: CapturingKmsClient()):
+            signature = signer.sign(signing_input)
+
+        self.assertEqual(signature, b"kms-signature")
+        self.assertEqual(captured_details[0].message_type, "DIGEST")
+        self.assertEqual(base64.b64decode(captured_details[0].message), hashlib.sha256(signing_input).digest())
+
     def test_oauth_client_credentials_skips_discovery_and_private_key_resolution(self):
         session = FakeTokenEndpointSession()
         factory = TokenFactory(
@@ -414,16 +402,25 @@ class TokenFactorySimplificationTests(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             factory.get_token("oracle-database", "PROCESS", "urn:oracle:db::id::*", client_key="orders")
 
-    def test_oci_principal_rejects_oci_profile_mode(self):
+    def test_oci_principal_accepts_oci_profile_mode(self):
+        calls = []
         factory = TokenFactory(
             runtime_config=runtime_config(oci_auth_mode="oci-profile"),
             oauth_apps=oauth_apps(),
             factory_oci_signer_builder=lambda _config: "factory-signer",
-            db_token_generator=lambda *_args: "header.payload.signature",
+            db_token_generator=lambda signer, public_key, scope, _config: calls.append((signer, public_key, scope)) or "header.payload.signature",
         )
 
-        with self.assertRaises(ConfigurationError):
-            factory.get_token("oracle-database", "OCI_PRINCIPAL", "urn:oracle:db::id::*", client_key="orders")
+        result = factory.get_token("oracle-database", "OCI_PRINCIPAL", "urn:oracle:db::id::*", client_key="orders")
+
+        self.assertEqual(result.principal_mode, "oci_principal")
+        self.assertEqual(calls[0][0], "factory-signer")
+
+    def test_oke_workload_identity_uses_oke_signer(self):
+        factory_support = sys.modules["token_factory._factory_support"]
+        config = type("Config", (), {"oci_auth_mode": "oke-workload-identity", "oci_auth_profile": "DEFAULT"})()
+
+        self.assertEqual(factory_support._get_factory_oci_signer(config), "oke-workload-identity-signer")
 
     def test_get_token_with_oci_credential_uses_signer_dictionary(self):
         session = FakeTokenEndpointSession()

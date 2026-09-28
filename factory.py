@@ -13,7 +13,6 @@ from urllib.parse import urlencode, urlsplit
 
 import jwt
 import requests
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from oci.auth.signers import TokenExchangeSigner
@@ -264,7 +263,6 @@ class TokenFactory:
         requested_scope = _require_scope(scope, "oracle-database")
         selector = _oracle_database_credential_selector(credential)
         if selector == ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL:
-            _require_oci_principal_database_auth_mode(self._runtime_config)
             cache_key = _cache_key("oracle-database-oci-principal", requested_scope, self._runtime_config.oci_auth_mode, self._runtime_config.domain_url, self._runtime_config.domain_region)
             cached = self._get_cached_result(cache_key, "oracle-database-oci-principal")
             if cached is not None:
@@ -535,15 +533,6 @@ def _oracle_database_credential_selector(credential: Credential) -> Optional[str
     return None
 
 
-def _require_oci_principal_database_auth_mode(runtime_config: TokenFactoryRuntimeConfig) -> None:
-    oci_auth_mode = str(runtime_config.oci_auth_mode or "").strip().lower()
-    if oci_auth_mode in {"", "instance-principal", "resource-principal"}:
-        return
-    raise ConfigurationError(
-        "oracle-database credential selector 'OCI_PRINCIPAL' supports only TF_SHARED_OCI_AUTH_MODE=instance-principal or resource-principal."
-    )
-
-
 def _generate_database_session_keypair_pem() -> Tuple[str, str]:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_key_pem = private_key.public_key().public_bytes(
@@ -790,23 +779,6 @@ def _propagation_trust_claim(hosting_component: ResolvedHostingComponent, token_
     if separator != ":" or not claim_name.strip() or not claim_value.strip():
         raise ConfigurationError("TF_CLIENT_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value")
     return {claim_name.strip(): claim_value.strip()}
-
-
-def _require_signing_identity(identity: Any, client_key: str) -> Tuple[str, str]:
-    if not identity.issuer:
-        raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
-    if not identity.private_key_pem:
-        raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing private key.")
-    return identity.issuer, identity.private_key_pem
-
-
-def _load_private_key(private_key_pem: str, passphrase: Optional[str]):
-    password = passphrase.encode("utf-8") if passphrase else None
-    return serialization.load_pem_private_key(
-        private_key_pem.encode("utf-8"),
-        password=password,
-        backend=default_backend(),
-    )
 
 
 def _expires_in(token: str) -> int:

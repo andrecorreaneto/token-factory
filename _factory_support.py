@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple
@@ -8,6 +9,7 @@ from cryptography.hazmat.primitives import serialization
 from oci.auth.signers import (
     InstancePrincipalsSecurityTokenSigner,
     TokenExchangeSigner,
+    get_oke_workload_identity_resource_principal_signer,
     get_resource_principals_signer,
 )
 from oci.config import from_file as load_oci_config
@@ -68,7 +70,8 @@ class KmsJwtSigner:
         from oci.key_management.models import SignDataDetails
 
         client = KmsCryptoClient(config={"region": self._runtime_config.oci_region}, service_endpoint=self._crypto_endpoint, signer=self._factory_signer_builder(self._runtime_config))
-        details = SignDataDetails(message=base64.b64encode(signing_input).decode("ascii"), message_type="RAW", key_id=self._key_id, key_version_id=self._key_version_id, signing_algorithm="SHA_256_RSA_PKCS1_V1_5")
+        digest = hashlib.sha256(signing_input).digest()
+        details = SignDataDetails(message=base64.b64encode(digest).decode("ascii"), message_type="DIGEST", key_id=self._key_id, key_version_id=self._key_version_id, signing_algorithm="SHA_256_RSA_PKCS1_V1_5")
         response = client.sign(details)
         try:
             return base64.b64decode(response.data.signature)
@@ -84,8 +87,8 @@ SUPPORTED_TOKEN_TYPES = (
 )
 TOKEN_TYPES_REQUIRING_SCOPE = ("oracle-database", "oauth")
 OCI_IDENTITY_AUDIENCE = "https://identity.oraclecloud.com/"
-_ALLOWED_OCI_AUTH_MODES = {"instance-principal", "oci-profile", "resource-principal"}
-_OCI_AUTH_MODE_ERROR = "TF_SHARED_OCI_AUTH_MODE must be one of: instance-principal, oci-profile, resource-principal"
+_ALLOWED_OCI_AUTH_MODES = {"instance-principal", "oci-profile", "resource-principal", "oke-workload-identity"}
+_OCI_AUTH_MODE_ERROR = "TF_SHARED_OCI_AUTH_MODE must be one of: instance-principal, oci-profile, resource-principal, oke-workload-identity"
 
 
 def _redact_ocid(value: Optional[str]) -> str:
@@ -235,6 +238,12 @@ def _get_factory_oci_signer(config: Any):
             return get_resource_principals_signer()
         except Exception as exc:
             raise ConfigurationError(f"Failed to initialize factory OCI signer with resource principal: {exc}.") from exc
+    if oci_auth_mode == "oke-workload-identity":
+        try:
+            LOGGER.info("Attempting factory OCI signer initialization with OKE workload identity.")
+            return get_oke_workload_identity_resource_principal_signer()
+        except Exception as exc:
+            raise ConfigurationError(f"Failed to initialize factory OCI signer with OKE workload identity: {exc}.") from exc
 
     try:
         LOGGER.info("Attempting factory OCI signer initialization with instance principals.")

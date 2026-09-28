@@ -35,18 +35,16 @@ output "clients_runtime_config_exports" {
     for client_key, config in module.token_factory_bootstrap.clients_runtime_config :
     client_key => join("\n", [
       for key, value in {
-        TF_CLIENT_KEY                                = client_key
-        TF_CLIENT_CREDS_SECRET_OCID                  = lookup(config.oauth_client_config, "client_credentials_secret_ocid", null)
-        TF_CLIENT_ISSUER                             = lookup(config.oauth_client_config, "issuer", null)
-        TF_CLIENT_PRIVATE_KEY_PATH                   = lookup(config.oauth_client_config, "private_key_path", null)
-        TF_CLIENT_PRIVATE_KEY_SECRET_OCID            = lookup(config.oauth_client_config, "private_key_secret_ocid", null)
-        TF_CLIENT_PRIVATE_KEY_PASSPHRASE_SECRET_OCID = lookup(config.oauth_client_config, "private_key_passphrase_secret_ocid", null)
-        TF_CLIENT_CERT_PATH                          = lookup(config.oauth_client_config, "certificate_path", null)
-        TF_CLIENT_CERT_SECRET_OCID                   = lookup(config.oauth_client_config, "certificate_secret_ocid", null)
-        TF_CLIENT_KID                                = lookup(config.oauth_client_config, "kid", null)
-        TF_CLIENT_RESOURCE_AUDIENCES                 = join(",", lookup(config.oauth_client_config, "resource_audiences", []))
-        TF_CLIENT_REQUIRED_INCOMING_SCOPES           = length(lookup(config.oauth_client_config, "required_incoming_scopes", [])) == 0 ? null : join(",", lookup(config.oauth_client_config, "required_incoming_scopes", []))
-        TF_CLIENT_PROPAGATION_TRUST_CLAIM            = lookup(config.oauth_client_config, "propagation_trust_claim", null)
+        TF_CLIENT_KEY                      = client_key
+        TF_CLIENT_CREDS_SECRET_OCID        = lookup(config.oauth_client_config, "client_credentials_secret_ocid", null)
+        TF_CLIENT_ISSUER                   = lookup(config.oauth_client_config, "issuer", null)
+        TF_CLIENT_KID                      = lookup(config.oauth_client_config, "kid", null)
+        TF_CLIENT_KMS_KEY_ID               = lookup(config.oauth_client_config, "kms_key_id", null)
+        TF_CLIENT_KMS_KEY_VERSION_ID       = lookup(config.oauth_client_config, "kms_key_version_id", null)
+        TF_CLIENT_KMS_CRYPTO_ENDPOINT      = lookup(config.oauth_client_config, "kms_crypto_endpoint", null)
+        TF_CLIENT_RESOURCE_AUDIENCES       = join(",", lookup(config.oauth_client_config, "resource_audiences", []))
+        TF_CLIENT_REQUIRED_INCOMING_SCOPES = length(lookup(config.oauth_client_config, "required_incoming_scopes", [])) == 0 ? null : join(",", lookup(config.oauth_client_config, "required_incoming_scopes", []))
+        TF_CLIENT_PROPAGATION_TRUST_CLAIM  = lookup(config.oauth_client_config, "propagation_trust_claim", null)
       } :
       "export ${key}=${jsonencode(tostring(value))}"
       if value != null
@@ -55,6 +53,6 @@ output "clients_runtime_config_exports" {
 }
 
 output "provisioned_resources" {
-  description = "Provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database setup commands."
+  description = "Provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database requirement guidance."
   value       = module.token_factory_bootstrap.provisioned_resources
 }
