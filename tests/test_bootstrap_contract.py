@@ -96,6 +96,20 @@ class BootstrapKmsSigningContractTests(unittest.TestCase):
 
 
 class BootstrapRuntimeShapeTests(unittest.TestCase):
+    def test_identity_domain_runtime_inputs_remain_base_url_and_regions(self):
+        variables = (ROOT / "bootstrap" / "variables.tf").read_text(encoding="utf-8")
+        locals_text = (ROOT / "bootstrap" / "locals.tf").read_text(encoding="utf-8")
+
+        self.assertIn('variable "identity_domain_url"', variables)
+        self.assertIn('variable "identity_domain_region"', variables)
+        self.assertIn('variable "region"', variables)
+        self.assertIn("TF_SHARED_DOMAIN_URL                  = var.identity_domain_url", locals_text)
+        self.assertIn("TF_SHARED_DOMAIN_REGION               = var.identity_domain_region", locals_text)
+        self.assertIn("TF_SHARED_OCI_REGION       = local.provider_region", locals_text)
+        for forbidden in ("TF_SHARED_TOKEN_ENDPOINT", "TF_SHARED_INTROSPECTION_ENDPOINT", "TF_SHARED_JWKS_URI", "TF_SHARED_IDENTITY_DOMAIN_ISSUER"):
+            self.assertNotIn(forbidden, variables)
+            self.assertNotIn(forbidden, locals_text)
+
     def test_runtime_uses_exactly_one_typed_object(self):
         variables = (ROOT / "bootstrap" / "variables.tf").read_text(encoding="utf-8")
         template = (ROOT / "bootstrap" / "client" / "terraform.tfvars.template").read_text(encoding="utf-8")

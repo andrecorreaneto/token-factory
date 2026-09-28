@@ -155,14 +155,14 @@ TokenFactory is essentially a helper library that hides the complexity of token 
 
 1. For assertion-backed flows, a client passes an incoming caller access token to `TokenFactory.get_token(...)`, along with the requested `token_type`, an optional downstream `scope`, and the required `client_key`.
 2. TokenFactory uses `client_key` to select the hosting application's OAuth app config, including client credentials, JWT signing material, resource audiences, and required incoming scopes.
-3. TokenFactory introspects the incoming caller token at the Identity Domain `/oauth2/v1/introspect` endpoint, authenticating with the resolved hosting app OAuth client.
+3. TokenFactory introspects the incoming caller token at the Identity Domain `introspection_endpoint` returned by OIDC discovery, authenticating with the resolved hosting app OAuth client.
 4. The introspection response must return `active=true`. If the token is inactive, unrecognized, expired, or otherwise invalid, TokenFactory fails closed.
 5. TokenFactory checks the introspection result against the resolved resource-server config: `aud` must match `resource_audiences`, and the incoming token scopes must include `required_incoming_scopes` when configured.
-6. TokenFactory discovers Identity Domain signing metadata from `<domain_url>/.well-known/openid-configuration`, reads the discovered issuer and JWKS URI, and validates the same incoming JWT signature and registered claims.
+6. During construction, TokenFactory reads `<domain_url>/.well-known/openid-configuration` once and retains an immutable snapshot containing the domain issuer, JWKS URI, token endpoint, and introspection endpoint. It uses the discovered issuer and JWKS URI to validate the same incoming JWT signature and registered claims.
 7. TokenFactory starts with the introspection claims, then overlays only the configured `groups_claim` from the validated JWT. This lets authorization use custom signed claims that introspection does not return.
 8. TokenFactory extracts the caller subject from `subject_claim` and caller groups from `groups_claim`.
 
-For `token_type="oauth"` with `credential=None`, TokenFactory does not run this caller assertion validation sequence. It resolves the selected hosting OAuth app from `client_key` and requests an application token directly with the OAuth client credentials grant.
+For `token_type="oauth"` with `credential=None`, TokenFactory still performs construction-time OIDC discovery but does not run caller assertion validation. It resolves the selected hosting OAuth app from `client_key` and requests an application token directly from the discovered token endpoint with the OAuth client credentials grant.
 
 ### Token Request Authorization
 
@@ -357,7 +357,7 @@ These variables populate `TokenFactoryRuntimeConfig` or process-level TokenFacto
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `TF_SHARED_DOMAIN_URL` | yes | Identity Domain base URL, for example `https://<domain>.identity.oraclecloud.com:443`. Trailing slash is removed. |
+| `TF_SHARED_DOMAIN_URL` | yes | Identity Domain base URL, for example `https://<domain>.identity.oraclecloud.com:443`. TokenFactory removes trailing slashes and reads `/.well-known/openid-configuration` beneath this URL once during construction. |
 | `TF_SHARED_DOMAIN_REGION` | yes | OCI region used for UPST `TokenExchangeSigner` and Identity Data Plane calls. |
 | `TF_SHARED_TIMEOUT_SECONDS` | optional | HTTP timeout in seconds; default `30`. |
 | `TF_SHARED_OCI_AUTH_MODE` | optional | OCI auth mode for factory-owned OCI SDK clients: `instance-principal` (default), `resource-principal`, or `oci-profile`. Required in practice when Vault OCIDs must be read. |
@@ -425,13 +425,17 @@ Important behavior details:
 - Direct client credentials avoid a Vault Secret read, but assertion signing still requires OCI KMS.
 - `TF_SHARED_OCI_AUTH_MODE` and `TF_SHARED_OCI_AUTH_PROFILE` apply to factory-owned OCI clients generally, including Vault secret reads.
 
-Hybrid validation notes:
+Identity Domain discovery and hybrid validation notes:
 
 - TokenFactory always validates caller assertions with hybrid validation: Identity Domain introspection must return `active=true`, and the same incoming JWT must validate against the Identity Domain signing keys.
-- TokenFactory always discovers `issuer` and `jwks_uri` from `<domain_url>/.well-known/openid-configuration`; clients do not configure validation mode, issuer, JWKS URL, or a custom validator.
+- TokenFactory discovers `issuer`, `jwks_uri`, `token_endpoint`, and `introspection_endpoint` once during construction from `<domain_url>/.well-known/openid-configuration`. The immutable snapshot is reused for the factory lifetime; construct a new factory to refresh it.
+- Construction fails closed when discovery is unreachable, unsuccessful, malformed, incomplete, or contains a required URL that is not a safe absolute HTTPS URL.
+- `TF_SHARED_DOMAIN_REGION` remains explicit because standard OIDC metadata does not publish the Identity Domain home region. `TF_SHARED_OCI_REGION` remains the separate OCI workload/resource region.
+- `TF_CLIENT_ISSUER` remains explicit: it is the hosting application's assertion issuer and is not the Identity Domain issuer returned by discovery.
+- Clients do not configure token, introspection, JWKS, or Identity Domain validation-issuer overrides.
 - TokenFactory copies the configured `groups_claim` from the validated JWT into the trusted claims so authorization can use custom signed claims that introspection omits.
 - For a custom authorization claim such as `group`, set `TokenFactoryRuntimeConfig(groups_claim="group")` and keep authorization policy groups keyed by claim values such as `all_users`.
-- Runtime access to the Identity Domain discovery document and JWKS endpoint is required.
+- Runtime network access to the Identity Domain discovery document, discovered token and introspection endpoints, and JWKS endpoint is required.
 
 Signed authorization policy notes:
 

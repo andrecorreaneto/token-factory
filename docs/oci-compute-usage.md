@@ -18,6 +18,10 @@ factory = TokenFactory(oauth_apps={
 result = factory.get_token(incoming_access_token, "oauth", "urn:opc:idm:orders.read", client_key="orders-api")
 ```
 
+At startup, each factory reads `{TF_SHARED_DOMAIN_URL}/.well-known/openid-configuration` once. OAuth exchanges, token introspection, and Identity Domain JWT validation use the discovered token endpoint, introspection endpoint, issuer, and JWKS URI for the factory lifetime. The workload must be able to reach those HTTPS endpoints; discovery failure prevents factory construction.
+
+`TF_SHARED_DOMAIN_REGION` remains the explicit Identity Domain home region, `TF_SHARED_OCI_REGION` remains the OCI workload/resource region, and the app-level `issuer` remains the explicit issuer for hosting assertions.
+
 Compute uses an exact instance principal, Functions use an exact resource principal, and OKE uses workload identity constrained by cluster, namespace, and service account. Local profile mode is supported but discouraged for OCI-hosted workloads.
 
 For `BOOTSTRAP_MANAGED`, Terraform creates the RSA KMS key and invokes the certificate registrar. The Terraform runner identity must have OCI KMS and Identity Domains access, and the selected Python interpreter must have `asn1crypto` installed through `requirements.txt`.

@@ -22,6 +22,10 @@ factory = TokenFactory(runtime_config=runtime_config, oauth_apps=oauth_apps)
 result = factory.get_token("<incoming-caller-access-token>", "oauth", "urn:opc:idm:orders.read", client_key="orders-api")
 ```
 
+`domain_url` remains the single Identity Domain base URL. Factory construction reads `{domain_url}/.well-known/openid-configuration` once, validates the discovered `issuer`, `jwks_uri`, `token_endpoint`, and `introspection_endpoint`, and reuses that immutable snapshot for the factory lifetime. `domain_region` and `oci_region` remain explicit because OIDC discovery does not define either OCI region, while the OAuth app `issuer` remains the separate issuer used in assertions created by the hosting application.
+
+Construction fails if discovery is unavailable or incomplete. Runtime networking must therefore reach the discovery document and its discovered endpoints before the factory can serve token requests.
+
 OAuth client credentials may still be supplied directly for controlled local testing. KMS signing remains mandatory for assertion-backed OAuth, Oracle Database, and OCI-service flows.
 
 `get_token_with_oci_credential()` remains independent of hosting-app KMS signing. Oracle Database session key pairs also remain ephemeral output material and are not hosting signing keys.
