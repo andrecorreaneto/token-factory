@@ -25,12 +25,8 @@ terraform {
   required_providers {
     oci = {
       source                = "oracle/oci"
-      version               = ">= 6.0.0"
+      version               = ">= 8.22.0"
       configuration_aliases = [oci.home]
-    }
-    tls = {
-      source  = "hashicorp/tls"
-      version = ">= 4.0.0"
     }
   }
 }

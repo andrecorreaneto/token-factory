@@ -6,6 +6,14 @@ data "oci_identity_tenancy" "this" {
 
 locals {
   provider_region = coalesce(var.region, var.identity_domain_region)
+  certificate_registration_oci_environment = {
+    TF_CERT_OCI_TENANCY_OCID         = var.tenancy_ocid
+    TF_CERT_OCI_USER_OCID            = var.user_ocid == null ? "" : var.user_ocid
+    TF_CERT_OCI_FINGERPRINT          = var.fingerprint == null ? "" : var.fingerprint
+    TF_CERT_OCI_PRIVATE_KEY_PATH     = var.private_key_path == null ? "" : var.private_key_path
+    TF_CERT_OCI_PRIVATE_KEY_PASSWORD = var.private_key_password == null ? "" : var.private_key_password
+    TF_CERT_OCI_REGION               = local.provider_region
+  }
 
   normalized_identity_domain_url              = lower(trimsuffix(var.identity_domain_url, "/"))
   normalized_identity_domain_url_without_port = replace(local.normalized_identity_domain_url, "/:443$/", "")
@@ -45,11 +53,15 @@ locals {
 
   raw_oauth_app_resource_names = {
     for key, component in var.oauth_apps :
-    key => trimspace(coalesce(component.resource_name_prefix, key))
+    key => trimspace(coalesce(component.resource_name_prefix, component.display_name))
+  }
+  effective_oauth_app_resource_names = {
+    for key, value in local.raw_oauth_app_resource_names :
+    key => value == "" ? trimspace(var.oauth_apps[key].display_name) : value
   }
   normalized_oauth_app_resource_names = {
-    for key, value in local.raw_oauth_app_resource_names :
-    key => replace(replace(lower(value == "" ? key : value), "_", "-"), " ", "-")
+    for key, value in local.effective_oauth_app_resource_names :
+    key => replace(replace(lower(value), "_", "-"), " ", "-")
   }
   identity_domain_app_role_grants = {
     for grant in flatten([
@@ -85,6 +97,17 @@ locals {
       fqs              = scope.fqs
     }
   }
+  identity_domain_scope_independent_apps = {
+    for key, component in var.oauth_apps :
+    key => component
+    if length(component.allowed_scopes) == 0
+  }
+  identity_domain_scope_consuming_apps = {
+    for key, component in var.oauth_apps :
+    key => component
+    if length(component.allowed_scopes) > 0
+  }
+  identity_domain_apps = merge(oci_identity_domains_app.these, oci_identity_domains_app.scope_consumers)
 
   names = {
     vault      = "${local.normalized_resource_name_prefix}-vault"
@@ -95,12 +118,9 @@ locals {
         client_app             = "${local.normalized_oauth_app_resource_names[key]}-client"
         propagation_trust      = "${local.normalized_oauth_app_resource_names[key]}-identity-propagation-trust"
         client_credentials     = "${local.normalized_oauth_app_resource_names[key]}-client-credentials-secret"
-        private_key            = "${local.normalized_oauth_app_resource_names[key]}-jwt-private-key-secret"
-        private_key_passphrase = "${local.normalized_oauth_app_resource_names[key]}-jwt-private-key-passphrase-secret"
-        certificate            = "${local.normalized_oauth_app_resource_names[key]}-jwt-certificate-secret"
         dynamic_group          = "${local.normalized_oauth_app_resource_names[key]}-dynamic-group"
         user_group             = "${local.normalized_oauth_app_resource_names[key]}-user-group"
-        policy                 = "${local.normalized_oauth_app_resource_names[key]}-secrets-policy"
+        policy                 = "${local.normalized_oauth_app_resource_names[key]}-policy"
         database_access_policy = "${local.normalized_oauth_app_resource_names[key]}-database-access-policy"
       }
     }
@@ -115,9 +135,6 @@ locals {
         client_app             = coalesce(component.description, "Token Factory OAuth app/client identity for ${key}.")
         propagation_trust      = "Token Factory JWT trust for ${key} UPST exchange."
         client_credentials     = "Token Factory OAuth client credentials for ${key}."
-        private_key            = "Token Factory JWT private key for ${key}."
-        private_key_passphrase = "Token Factory JWT private key passphrase for ${key}."
-        certificate            = "Token Factory JWT certificate for ${key}."
         dynamic_group          = "Token Factory runtime identity for ${key}."
         user_group             = "Token Factory API-key runtime identity for ${key}."
         policy                 = "Token Factory Vault secret read access for ${key}."
@@ -126,32 +143,26 @@ locals {
     }
   }
 
-  create_vault       = var.enable_oci_secrets && var.oci_vault_existing_ocid == null
-  use_existing_vault = var.enable_oci_secrets && var.oci_vault_existing_ocid != null
+  requires_vault     = var.enable_oci_secrets || length(var.oauth_apps) > 0
+  create_vault       = local.requires_vault && var.oci_vault_existing_ocid == null
+  use_existing_vault = local.requires_vault && var.oci_vault_existing_ocid != null
   create_master_key  = var.enable_oci_secrets && var.oci_master_key_existing_ocid == null
 
-  generated_key_material_components = {
-    for key, component in var.oauth_apps :
-    key => component
-    if component.jwt_key_material_source == "generate"
+  managed_signing_components = {
+    for key, component in var.oauth_apps : key => component
+    if component.signing_key.mode == "BOOTSTRAP_MANAGED"
   }
-  vault_key_material_components = {
-    for key, component in var.oauth_apps :
-    key => component
-    if var.enable_oci_secrets && contains(["generate", "provided_pem"], component.jwt_key_material_source)
+  external_signing_components = {
+    for key, component in var.oauth_apps : key => component
+    if component.signing_key.mode == "EXTERNALLY_MANAGED"
   }
-
-  jwt_private_key_pem_values = {
-    for key, component in var.oauth_apps :
-    key => component.jwt_key_material_source == "generate" ? tls_private_key.these[key].private_key_pem : component.jwt_private_key_pem
-  }
-  jwt_certificate_pem_values = {
-    for key, component in var.oauth_apps :
-    key => component.jwt_key_material_source == "generate" ? tls_self_signed_cert.these[key].cert_pem : component.jwt_certificate_pem
+  external_signing_certificate_pem_values = {
+    for key, component in local.external_signing_components :
+    key => component.signing_key.signing_certificate_pem != null ? component.signing_key.signing_certificate_pem : file(component.signing_key.signing_certificate_path)
   }
   identity_domain_certificate_pem_values = {
     for key, component in var.oauth_apps :
-    key => component.jwt_key_material_source == "existing_secret_ocids" ? component.jwt_certificate_pem_for_identity_domain : local.jwt_certificate_pem_values[key]
+    key => component.signing_key.mode == "BOOTSTRAP_MANAGED" ? try(data.oci_identity_domains_oauth_partner_certificates.managed[key].oauth_partner_certificates[0].x509base64certificate, null) : local.external_signing_certificate_pem_values[key]
   }
   identity_domain_certificate_compact_pem_values = {
     for key, value in local.identity_domain_certificate_pem_values :
@@ -162,50 +173,82 @@ locals {
     key => value == null ? null : replace(replace(value, "-----BEGIN CERTIFICATE-----", ""), "-----END CERTIFICATE-----", "")
   }
 
-  vault_id = var.enable_oci_secrets ? (
+  vault_id = local.requires_vault ? (
     local.create_vault ? oci_kms_vault.this[0].id : var.oci_vault_existing_ocid
   ) : null
-  vault_management_endpoint = var.enable_oci_secrets ? (
+  vault_management_endpoint = local.requires_vault ? (
     local.create_vault ? oci_kms_vault.this[0].management_endpoint : data.oci_kms_vault.existing[0].management_endpoint
+  ) : null
+  vault_crypto_endpoint = local.requires_vault ? (
+    local.create_vault ? oci_kms_vault.this[0].crypto_endpoint : data.oci_kms_vault.existing[0].crypto_endpoint
   ) : null
   master_key_id = var.enable_oci_secrets ? (
     local.create_master_key ? oci_kms_key.this[0].id : var.oci_master_key_existing_ocid
   ) : null
 
+  signing_key_ids = {
+    for key, component in var.oauth_apps :
+    key => component.signing_key.mode == "BOOTSTRAP_MANAGED" ? oci_kms_key.signing[key].id : component.signing_key.signing_key_ocid
+  }
+  signing_key_version_ids = {
+    for key, component in var.oauth_apps :
+    key => component.signing_key.mode == "BOOTSTRAP_MANAGED" ? coalesce(component.signing_key.signing_key_version_ocid, oci_kms_key.signing[key].current_key_version) : component.signing_key.signing_key_version_ocid
+  }
+  signing_key_compartment_ids = {
+    for key, component in var.oauth_apps :
+    key => component.signing_key.mode == "BOOTSTRAP_MANAGED" ? var.oci_secrets_compartment_ocid : data.oci_kms_key.external[key].compartment_id
+  }
+
+  runtime_configs = {
+    for key, component in var.oauth_apps :
+    key => component.compute_runtime != null ? {
+      principal_type   = "compute-instance"
+      resource_ocid    = component.compute_runtime.instance_ocid
+      cluster_ocid     = null
+      namespace        = null
+      service_account  = null
+      oci_auth_profile = null
+      database_access  = component.database_access
+      } : component.function_runtime != null ? {
+      principal_type   = "oci-function"
+      resource_ocid    = component.function_runtime.function_ocid
+      cluster_ocid     = null
+      namespace        = null
+      service_account  = null
+      oci_auth_profile = null
+      database_access  = component.database_access
+      } : component.oke_runtime != null ? {
+      principal_type   = "oke-workload"
+      resource_ocid    = null
+      cluster_ocid     = component.oke_runtime.cluster_ocid
+      namespace        = component.oke_runtime.namespace
+      service_account  = component.oke_runtime.service_account
+      oci_auth_profile = null
+      database_access  = component.database_access
+      } : {
+      principal_type   = "user-group"
+      resource_ocid    = null
+      cluster_ocid     = null
+      namespace        = null
+      service_account  = null
+      oci_auth_profile = component.local_runtime.oci_auth_profile
+      database_access  = component.database_access
+    }
+  }
+
   client_credentials = {
     for key, component in var.oauth_apps :
-    key => "${oci_identity_domains_app.these[key].name}:${oci_identity_domains_app.these[key].client_secret}"
+    key => "${local.identity_domain_apps[key].name}:${local.identity_domain_apps[key].client_secret}"
   }
 
   client_credentials_secret_ocids = {
     for key, component in var.oauth_apps :
     key => var.enable_oci_secrets ? oci_vault_secret.client_credentials[key].id : null
   }
-  private_key_secret_ocids = {
-    for key, component in var.oauth_apps :
-    key => var.enable_oci_secrets ? (
-      component.jwt_key_material_source == "existing_secret_ocids" ? component.private_key_secret_existing_ocid : oci_vault_secret.private_keys[key].id
-    ) : null
-  }
-  private_key_passphrase_secret_ocids = {
-    for key, component in var.oauth_apps :
-    key => var.enable_oci_secrets ? (
-      component.jwt_key_material_source == "existing_secret_ocids" ? component.private_key_passphrase_secret_existing_ocid : (
-        component.jwt_private_key_passphrase == null ? null : oci_vault_secret.private_key_passphrases[key].id
-      )
-    ) : null
-  }
-  certificate_secret_ocids = {
-    for key, component in var.oauth_apps :
-    key => var.enable_oci_secrets ? (
-      component.jwt_key_material_source == "existing_secret_ocids" ? component.certificate_secret_existing_ocid : oci_vault_secret.certificates[key].id
-    ) : null
-  }
-
   dynamic_group_components = {
     for key, component in var.oauth_apps :
     key => component
-    if component.runtime.principal_type != "user-group"
+    if !contains(["user-group", "oke-workload"], local.runtime_configs[key].principal_type)
   }
   default_dynamic_group_components = local.selected_identity_domain_is_default ? local.dynamic_group_components : {}
   custom_dynamic_group_components  = local.selected_identity_domain_is_default ? {} : local.dynamic_group_components
@@ -213,7 +256,7 @@ locals {
   user_group_components = {
     for key, component in var.oauth_apps :
     key => component
-    if component.runtime.principal_type == "user-group"
+    if local.runtime_configs[key].principal_type == "user-group"
   }
   default_user_group_components = local.selected_identity_domain_is_default ? local.user_group_components : {}
   custom_user_group_components  = local.selected_identity_domain_is_default ? {} : local.user_group_components
@@ -221,24 +264,21 @@ locals {
   runtime_resource_types = {
     for key, component in var.oauth_apps :
     key => (
-      component.runtime.principal_type == "oke-cluster" ? "cluster" :
-      component.runtime.principal_type == "oci-function" ? "fnfunc" :
+      local.runtime_configs[key].principal_type == "oci-function" ? "fnfunc" :
       null
     )
   }
   runtime_matching_rules = {
     for key, component in local.dynamic_group_components :
     key => (
-      component.runtime.principal_type == "compute-instance" && component.runtime.resource_ocid == null ? "instance.compartment.id = '${component.runtime.compartment_ocid}'" :
-      component.runtime.principal_type == "compute-instance" ? "instance.id = '${component.runtime.resource_ocid}'" :
-      component.runtime.resource_ocid == null ? "ALL {resource.type = '${local.runtime_resource_types[key]}', resource.compartment.id = '${component.runtime.compartment_ocid}'}" :
-      "ALL {resource.type = '${local.runtime_resource_types[key]}', resource.id = '${component.runtime.resource_ocid}', resource.compartment.id = '${component.runtime.compartment_ocid}'}"
+      local.runtime_configs[key].principal_type == "compute-instance" ? "instance.id = '${local.runtime_configs[key].resource_ocid}'" :
+      "ALL {resource.type = '${local.runtime_resource_types[key]}', resource.id = '${local.runtime_configs[key].resource_ocid}'}"
     )
   }
 
   runtime_principal_names = {
     for key, component in var.oauth_apps :
-    key => component.runtime.principal_type == "user-group" ? (
+    key => local.runtime_configs[key].principal_type == "oke-workload" ? "OKE workload ${local.runtime_configs[key].cluster_ocid}/${local.runtime_configs[key].namespace}/${local.runtime_configs[key].service_account}" : local.runtime_configs[key].principal_type == "user-group" ? (
       local.selected_identity_domain_is_default ? oci_identity_group.these[key].name : oci_identity_domains_group.these[key].display_name
       ) : (
       local.selected_identity_domain_is_default ? oci_identity_dynamic_group.these[key].name : oci_identity_domains_dynamic_resource_group.these[key].display_name
@@ -246,7 +286,7 @@ locals {
   }
   runtime_principal_ids = {
     for key, component in var.oauth_apps :
-    key => component.runtime.principal_type == "user-group" ? (
+    key => local.runtime_configs[key].principal_type == "oke-workload" ? null : local.runtime_configs[key].principal_type == "user-group" ? (
       local.selected_identity_domain_is_default ? oci_identity_group.these[key].id : coalesce(oci_identity_domains_group.these[key].ocid, oci_identity_domains_group.these[key].id)
       ) : (
       local.selected_identity_domain_is_default ? oci_identity_dynamic_group.these[key].id : coalesce(oci_identity_domains_dynamic_resource_group.these[key].ocid, oci_identity_domains_dynamic_resource_group.these[key].id)
@@ -254,24 +294,37 @@ locals {
   }
   runtime_principal_kinds = {
     for key, component in var.oauth_apps :
-    key => component.runtime.principal_type == "user-group" ? "group" : "dynamic-group"
+    key => local.runtime_configs[key].principal_type == "oke-workload" ? "any-user" : local.runtime_configs[key].principal_type == "user-group" ? "group" : "dynamic-group"
   }
   runtime_principal_subject_names = {
     for key, component in var.oauth_apps :
-    key => local.selected_identity_domain_is_default ? local.runtime_principal_names[key] : "'${local.selected_identity_domain_name}'/'${local.runtime_principal_names[key]}'"
+    key => local.runtime_configs[key].principal_type == "oke-workload" ? null : local.selected_identity_domain_is_default ? local.runtime_principal_names[key] : "'${local.selected_identity_domain_name}'/'${local.runtime_principal_names[key]}'"
   }
   runtime_principal_subjects = {
     for key, component in var.oauth_apps :
-    key => "${local.runtime_principal_kinds[key]} ${local.runtime_principal_subject_names[key]}"
+    key => local.runtime_configs[key].principal_type == "oke-workload" ? "any-user" : "${local.runtime_principal_kinds[key]} ${local.runtime_principal_subject_names[key]}"
   }
+
+  runtime_principal_conditions = {
+    for key, component in var.oauth_apps :
+    key => local.runtime_configs[key].principal_type == "oke-workload" ? [
+      "request.principal.type = 'workload'",
+      "request.principal.cluster_id = '${local.runtime_configs[key].cluster_ocid}'",
+      "request.principal.namespace = '${local.runtime_configs[key].namespace}'",
+      "request.principal.service_account = '${local.runtime_configs[key].service_account}'",
+    ] : []
+  }
+  oke_workload_mapping_groups = {
+    for key, component in var.oauth_apps :
+    "${local.runtime_configs[key].cluster_ocid}:${local.runtime_configs[key].namespace}" => local.runtime_configs[key]...
+    if local.runtime_configs[key].principal_type == "oke-workload"
+  }
+  oke_workload_mappings = { for identity, runtimes in local.oke_workload_mapping_groups : identity => runtimes[0] }
 
   oauth_app_runtime_secret_ocids = {
     for key, component in var.oauth_apps :
     key => compact([
       local.client_credentials_secret_ocids[key],
-      local.private_key_secret_ocids[key],
-      local.private_key_passphrase_secret_ocids[key],
-      local.certificate_secret_ocids[key],
     ])
   }
   runtime_secret_ocids = {
@@ -282,46 +335,36 @@ locals {
     )))
   }
 
-  base_secret_policy_statements = {
-    for key, component in var.oauth_apps :
-    key => [
-      "allow ${local.runtime_principal_subjects[key]} to read secret-bundles in compartment id ${var.oci_secrets_compartment_ocid}"
-    ]
-  }
   restricted_secret_policy_statements = {
     for key, component in var.oauth_apps :
     key => [
       for secret_ocid in local.runtime_secret_ocids[key] :
-      "allow ${local.runtime_principal_subjects[key]} to read secret-bundles in compartment id ${var.oci_secrets_compartment_ocid} where target.secret.id = '${secret_ocid}'"
+      "allow ${local.runtime_principal_subjects[key]} to read secret-bundles in compartment id ${var.oci_secrets_compartment_ocid} where all {${join(", ", concat(local.runtime_principal_conditions[key], ["target.secret.id = '${secret_ocid}'"]))}}"
     ]
   }
   secret_policy_statements = {
     for key, component in var.oauth_apps :
-    key => var.restrict_secret_policy_to_secret_ocids ? local.restricted_secret_policy_statements[key] : local.base_secret_policy_statements[key]
+    key => local.restricted_secret_policy_statements[key]
+  }
+  secret_access_components = {
+    for key, component in var.oauth_apps : key => component
+    if var.enable_oci_secrets || var.token_factory_authz_policy_secret_ocid != null
+  }
+  signing_key_policy_statements = {
+    for key, component in var.oauth_apps :
+    key => "allow ${local.runtime_principal_subjects[key]} to use keys in compartment id ${local.signing_key_compartment_ids[key]} where all {${join(", ", concat(local.runtime_principal_conditions[key], ["target.key.id = '${local.signing_key_ids[key]}'"]))}}"
   }
   database_access_components = {
     for key, component in var.oauth_apps :
     key => component
-    if component.runtime.database_access != null
+    if component.database_access != null
   }
   database_access_policy_statements = {
     for key, component in local.database_access_components :
     key => [
-      "allow ${local.runtime_principal_subjects[key]} to use database-connections in compartment id ${component.runtime.database_access.target_database_compartment_ocid} where target.database.id = '${component.runtime.database_access.target_database_ocid}'"
+      "allow ${local.runtime_principal_subjects[key]} to use database-connections in compartment id ${component.database_access.target_database_compartment_ocid} where all {${join(", ", concat(local.runtime_principal_conditions[key], ["target.database.id = '${component.database_access.target_database_ocid}'"]))}}"
     ]
   }
-  database_access_db_user_names = {
-    for key, component in local.database_access_components :
-    key => upper(replace(local.runtime_principal_names[key], "/[^0-9A-Za-z]+/", "_"))
-  }
-  database_access_requirement_commands = {
-    for key, component in local.database_access_components :
-    key => [
-      "CREATE USER ${local.database_access_db_user_names[key]} IDENTIFIED GLOBALLY AS 'IAM_GROUP_NAME=${local.selected_identity_domain_name}/${local.runtime_principal_names[key]}';",
-      "GRANT CREATE SESSION TO ${local.database_access_db_user_names[key]};",
-    ]
-  }
-
   token_factory_shared_runtime_config = {
     for key, value in {
       TF_SHARED_DOMAIN_URL                  = var.identity_domain_url
@@ -356,8 +399,9 @@ locals {
   runtime_oci_auth_modes = {
     for key, component in var.oauth_apps :
     key => (
-      component.runtime.principal_type == "compute-instance" ? "instance-principal" :
-      component.runtime.principal_type == "user-group" ? "oci-profile" :
+      local.runtime_configs[key].principal_type == "compute-instance" ? "instance-principal" :
+      local.runtime_configs[key].principal_type == "user-group" ? "oci-profile" :
+      local.runtime_configs[key].principal_type == "oke-workload" ? "oke-workload-identity" :
       "resource-principal"
     )
   }
@@ -369,8 +413,8 @@ locals {
       {
         for runtime_key, runtime_value in {
           TF_SHARED_OCI_AUTH_MODE    = local.runtime_oci_auth_modes[key]
-          TF_SHARED_OCI_AUTH_PROFILE = component.runtime.principal_type == "user-group" ? coalesce(component.runtime.oci_auth_profile, "DEFAULT") : null
-          TF_SHARED_OCI_REGION       = coalesce(component.runtime.oci_region, var.oci_secrets_region, var.identity_domain_region)
+          TF_SHARED_OCI_AUTH_PROFILE = local.runtime_configs[key].principal_type == "user-group" ? local.runtime_configs[key].oci_auth_profile : null
+          TF_SHARED_OCI_REGION       = local.provider_region
         } : runtime_key => runtime_value if runtime_value != null
       }
     )
@@ -380,17 +424,15 @@ locals {
     for key, component in var.oauth_apps :
     key => {
       for config_key, config_value in {
-        client_credentials_secret_ocid     = local.client_credentials_secret_ocids[key]
-        issuer                             = component.issuer
-        private_key_path                   = null
-        private_key_secret_ocid            = local.private_key_secret_ocids[key]
-        private_key_passphrase_secret_ocid = local.private_key_passphrase_secret_ocids[key]
-        certificate_path                   = null
-        certificate_secret_ocid            = local.certificate_secret_ocids[key]
-        kid                                = component.kid
-        resource_audiences                 = component.resource_audiences
-        required_incoming_scopes           = component.resource_scopes
-        propagation_trust_claim            = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
+        client_credentials_secret_ocid = local.client_credentials_secret_ocids[key]
+        issuer                         = component.issuer
+        kid                            = component.kid
+        kms_key_id                     = local.signing_key_ids[key]
+        kms_key_version_id             = local.signing_key_version_ids[key]
+        kms_crypto_endpoint            = local.vault_crypto_endpoint
+        resource_audiences             = component.resource_audiences
+        required_incoming_scopes       = component.resource_scopes
+        propagation_trust_claim        = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
       } : config_key => config_value if config_value != null
     }
   }
@@ -401,10 +443,7 @@ locals {
       local.oauth_app_configs[key],
       {
         for config_key, config_value in {
-          client_credentials     = var.enable_oci_secrets ? null : local.client_credentials[key]
-          private_key_pem        = var.enable_oci_secrets ? null : local.jwt_private_key_pem_values[key]
-          private_key_passphrase = var.enable_oci_secrets ? null : component.jwt_private_key_passphrase
-          certificate_pem        = var.enable_oci_secrets ? null : local.jwt_certificate_pem_values[key]
+          client_credentials = var.enable_oci_secrets ? null : local.client_credentials[key]
         } : config_key => config_value if config_value != null
       }
     )
@@ -414,16 +453,16 @@ locals {
     for key, component in var.oauth_apps :
     key => {
       for config_key, config_value in {
-        TF_CLIENT_KEY                                = key
-        TF_CLIENT_CREDS_SECRET_OCID                  = local.client_credentials_secret_ocids[key]
-        TF_CLIENT_ISSUER                             = component.issuer
-        TF_CLIENT_PRIVATE_KEY_SECRET_OCID            = local.private_key_secret_ocids[key]
-        TF_CLIENT_PRIVATE_KEY_PASSPHRASE_SECRET_OCID = local.private_key_passphrase_secret_ocids[key]
-        TF_CLIENT_CERT_SECRET_OCID                   = local.certificate_secret_ocids[key]
-        TF_CLIENT_KID                                = component.kid
-        TF_CLIENT_RESOURCE_AUDIENCES                 = join(",", component.resource_audiences)
-        TF_CLIENT_REQUIRED_INCOMING_SCOPES           = length(component.resource_scopes) == 0 ? null : join(",", component.resource_scopes)
-        TF_CLIENT_PROPAGATION_TRUST_CLAIM            = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
+        TF_CLIENT_KEY                      = key
+        TF_CLIENT_CREDS_SECRET_OCID        = local.client_credentials_secret_ocids[key]
+        TF_CLIENT_ISSUER                   = component.issuer
+        TF_CLIENT_KID                      = component.kid
+        TF_CLIENT_KMS_KEY_ID               = local.signing_key_ids[key]
+        TF_CLIENT_KMS_KEY_VERSION_ID       = local.signing_key_version_ids[key]
+        TF_CLIENT_KMS_CRYPTO_ENDPOINT      = local.vault_crypto_endpoint
+        TF_CLIENT_RESOURCE_AUDIENCES       = join(",", component.resource_audiences)
+        TF_CLIENT_REQUIRED_INCOMING_SCOPES = length(component.resource_scopes) == 0 ? null : join(",", component.resource_scopes)
+        TF_CLIENT_PROPAGATION_TRUST_CLAIM  = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
       } : config_key => config_value if config_value != null
     }
   }
@@ -434,10 +473,7 @@ locals {
       local.token_factory_client_configs[key],
       {
         for config_key, config_value in {
-          TF_CLIENT_CREDS                  = var.enable_oci_secrets ? null : local.client_credentials[key]
-          TF_CLIENT_PRIVATE_KEY_PEM        = var.enable_oci_secrets ? null : local.jwt_private_key_pem_values[key]
-          TF_CLIENT_PRIVATE_KEY_PASSPHRASE = var.enable_oci_secrets ? null : component.jwt_private_key_passphrase
-          TF_CLIENT_CERT_PEM               = var.enable_oci_secrets ? null : local.jwt_certificate_pem_values[key]
+          TF_CLIENT_CREDS = var.enable_oci_secrets ? null : local.client_credentials[key]
         } : config_key => config_value if config_value != null
       }
     )
@@ -446,12 +482,12 @@ locals {
   runtime_principals = {
     for key, component in var.oauth_apps :
     key => {
-      principal_type = component.runtime.principal_type
+      principal_type = local.runtime_configs[key].principal_type
       principal_kind = local.runtime_principal_kinds[key]
       name           = local.runtime_principal_names[key]
       id             = local.runtime_principal_ids[key]
       subject        = local.runtime_principal_subjects[key]
-      matching_rule  = component.runtime.principal_type == "user-group" ? null : local.runtime_matching_rules[key]
+      matching_rule  = try(local.runtime_matching_rules[key], null)
     }
   }
 }

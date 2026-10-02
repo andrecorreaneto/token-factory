@@ -56,6 +56,12 @@ variable "identity_domain_region" {
   type        = string
 }
 
+variable "certificate_registration_python_command" {
+  description = "Python command used by the bootstrap-managed KMS certificate registration utility."
+  type        = string
+  default     = "python"
+}
+
 variable "enable_oci_secrets" {
   description = "When true, store OAuth app material in OCI Secrets and output secret OCIDs."
   type        = bool
@@ -80,18 +86,6 @@ variable "oci_master_key_existing_ocid" {
   default     = null
 }
 
-variable "oci_secrets_region" {
-  description = "Fallback region TokenFactory should use for OCI Secrets access when an OAuth app runtime does not set runtime.oci_region."
-  type        = string
-  default     = null
-}
-
-variable "restrict_secret_policy_to_secret_ocids" {
-  description = "When true, generated per-runtime Vault read policies include where clauses for individual secret OCIDs."
-  type        = bool
-  default     = false
-}
-
 variable "token_factory_timeout_seconds" {
   description = "TokenFactory HTTP timeout in seconds."
   type        = number
@@ -103,10 +97,6 @@ variable "token_factory_subject_claim" {
   type        = string
   default     = "sub"
 
-  validation {
-    condition     = trimspace(var.token_factory_subject_claim) != ""
-    error_message = "token_factory_subject_claim must not be empty."
-  }
 }
 
 variable "token_factory_groups_claim" {
@@ -114,10 +104,6 @@ variable "token_factory_groups_claim" {
   type        = string
   default     = "groups"
 
-  validation {
-    condition     = trimspace(var.token_factory_groups_claim) != ""
-    error_message = "token_factory_groups_claim must not be empty."
-  }
 }
 
 variable "token_factory_log_full_assertion" {
@@ -137,10 +123,6 @@ variable "token_factory_authz_policy_signature_mode" {
   type        = string
   default     = "off"
 
-  validation {
-    condition     = contains(["off", "on"], var.token_factory_authz_policy_signature_mode)
-    error_message = "token_factory_authz_policy_signature_mode must be one of off or on."
-  }
 }
 
 variable "token_factory_authz_policy_trusted_signers" {
@@ -179,155 +161,47 @@ variable "oauth_apps" {
     allowed_scopes       = optional(list(string), [])
     app_roles            = optional(list(string), [])
 
-    runtime = object({
-      principal_type   = string
-      compartment_ocid = string
-      resource_ocid    = optional(string, null)
-      oci_auth_profile = optional(string, null)
-      oci_region       = optional(string, null)
-      database_access = optional(object({
-        target_database_compartment_ocid = string
-        target_database_ocid             = string
-      }), null)
-    })
+    compute_runtime = optional(object({
+      instance_ocid = string
+    }), null)
+    function_runtime = optional(object({
+      function_ocid = string
+    }), null)
+    oke_runtime = optional(object({
+      cluster_ocid    = string
+      namespace       = string
+      service_account = string
+    }), null)
+    local_runtime = optional(object({
+      oci_auth_profile = optional(string, "DEFAULT")
+    }), null)
+    database_access = optional(object({
+      target_database_compartment_ocid = string
+      target_database_ocid             = string
+    }), null)
 
     enable_identity_propagation_trust = optional(bool, true)
     propagation_trust_claim_name      = optional(string, null)
     propagation_trust_claim_value     = optional(string, null)
 
-    jwt_key_material_source = optional(string, "generate")
-
-    jwt_private_key_pem                     = optional(string, null)
-    jwt_private_key_passphrase              = optional(string, null)
-    jwt_certificate_pem                     = optional(string, null)
-    jwt_certificate_pem_for_identity_domain = optional(string, null)
-
-    private_key_secret_existing_ocid            = optional(string, null)
-    private_key_passphrase_secret_existing_ocid = optional(string, null)
-    certificate_secret_existing_ocid            = optional(string, null)
+    signing_key = object({
+      mode                     = string
+      signing_key_ocid         = optional(string, null)
+      signing_key_version_ocid = optional(string, null)
+      signing_certificate_pem  = optional(string, null)
+      signing_certificate_path = optional(string, null)
+    })
   }))
   default = {}
 
-  validation {
-    condition = alltrue([
-      for key, component in var.oauth_apps :
-      trimspace(key) != "" &&
-      key == upper(key) &&
-      trimspace(component.display_name) != "" &&
-      trimspace(component.issuer) != "" &&
-      trimspace(component.kid) != "" &&
-      length(component.resource_audiences) > 0
-    ])
-    error_message = "Each oauth_apps key must be non-empty and uppercase; display_name, issuer, kid, and resource_audiences must be non-empty."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      contains(["compute-instance", "oci-function", "oke-cluster", "user-group"], component.runtime.principal_type)
-    ])
-    error_message = "oauth_apps[*].runtime.principal_type must be one of compute-instance, oci-function, oke-cluster, or user-group."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      trimspace(component.runtime.compartment_ocid) != ""
-    ])
-    error_message = "oauth_apps[*].runtime.compartment_ocid must not be empty."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      contains(["generate", "provided_pem", "existing_secret_ocids"], component.jwt_key_material_source)
-    ])
-    error_message = "oauth_apps[*].jwt_key_material_source must be one of generate, provided_pem, or existing_secret_ocids."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      (component.propagation_trust_claim_name == null && component.propagation_trust_claim_value == null) ||
-      (component.propagation_trust_claim_name != null && component.propagation_trust_claim_value != null)
-    ])
-    error_message = "oauth_apps[*].propagation_trust_claim_name and propagation_trust_claim_value must either both be set or both be omitted."
-  }
 
-  validation {
-    condition = alltrue(flatten([
-      for component in var.oauth_apps : [
-        for scope in component.allowed_scopes :
-        trimspace(scope) != ""
-      ]
-    ]))
-    error_message = "oauth_apps[*].allowed_scopes values must not be empty."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      component.runtime.database_access == null ||
-      component.runtime.principal_type != "user-group"
-    ])
-    error_message = "oauth_apps[*].runtime.database_access requires a dynamic-group runtime; user-group runtimes are not supported."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      component.runtime.database_access == null ||
-      trimspace(component.runtime.database_access.target_database_compartment_ocid) != ""
-    ])
-    error_message = "oauth_apps[*].runtime.database_access.target_database_compartment_ocid must not be empty."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      component.runtime.database_access == null ||
-      trimspace(component.runtime.database_access.target_database_ocid) != ""
-    ])
-    error_message = "oauth_apps[*].runtime.database_access.target_database_ocid must not be empty."
-  }
 
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      length(component.app_roles) == length(distinct(component.app_roles)) &&
-      alltrue([
-        for role in component.app_roles :
-        trimspace(role) != "" &&
-        contains([
-          "Me",
-          "Approval Workflow Administrator",
-          "Identity Domain Administrator",
-          "Reset Password",
-          "User Manager",
-          "User Administrator",
-          "Kerberos Administrator",
-          "Verify Email",
-          "Change Password",
-          "Posix Viewer",
-          "DB Administrator",
-          "Me Password Validator",
-          "Digitalid Wallet",
-          "Digitalid Verifier",
-          "Digitalid Issuer",
-          "Digitalid Admin",
-          "Help Desk Administrator",
-          "Audit Administrator",
-          "MFA Client",
-          "Security Administrator",
-          "Authenticator Client",
-          "Self Registration",
-          "Cloud Gate",
-          "Forgot Password",
-          "Signin",
-          "Application Administrator"
-        ], role)
-      ])
-    ])
-    error_message = "oauth_apps[*].app_roles must contain unique supported Identity Domain app role display names."
-  }
+
 }

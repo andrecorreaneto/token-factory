@@ -95,7 +95,7 @@ factory.get_token("oracle-database", caller_jwt, db_scope, client_key="MCP_SERVE
 factory.get_token("oracle-database", "OCI_PRINCIPAL", db_scope, client_key="MCP_SERVER")
 ```
 
-`OCI_PRINCIPAL` is case-insensitive. It defaults to `TF_SHARED_OCI_AUTH_MODE=instance-principal`; set `TF_SHARED_OCI_AUTH_MODE=resource-principal` for resource-principal runtimes. `TF_SHARED_OCI_AUTH_MODE=oci-profile` is rejected for this database-token path. The reserved selector `PROCESS` is intentionally not implemented yet and is kept for future RPST process-principal support.
+`OCI_PRINCIPAL` is case-insensitive and uses the factory's configured OCI signer: instance principal, resource principal, OKE workload identity, or OCI profile. The reserved selector `PROCESS` is intentionally not implemented.
 
 Oracle Database results still unpack as `(token, private_key_pem, expires_in, token_type, issued_token_type)`. They also expose `principal_mode` and `expires_at_epoch` attributes for connection-pool lifecycle decisions. Pool keys for OCI-principal database tokens should include the connect target, database token scope, and principal mode, and pools should be retired before `expires_at_epoch`.
 
@@ -155,14 +155,14 @@ TokenFactory is essentially a helper library that hides the complexity of token 
 
 1. For assertion-backed flows, a client passes an incoming caller access token to `TokenFactory.get_token(...)`, along with the requested `token_type`, an optional downstream `scope`, and the required `client_key`.
 2. TokenFactory uses `client_key` to select the hosting application's OAuth app config, including client credentials, JWT signing material, resource audiences, and required incoming scopes.
-3. TokenFactory introspects the incoming caller token at the Identity Domain `/oauth2/v1/introspect` endpoint, authenticating with the resolved hosting app OAuth client.
+3. TokenFactory introspects the incoming caller token at the Identity Domain `introspection_endpoint` returned by OIDC discovery, authenticating with the resolved hosting app OAuth client.
 4. The introspection response must return `active=true`. If the token is inactive, unrecognized, expired, or otherwise invalid, TokenFactory fails closed.
 5. TokenFactory checks the introspection result against the resolved resource-server config: `aud` must match `resource_audiences`, and the incoming token scopes must include `required_incoming_scopes` when configured.
-6. TokenFactory discovers Identity Domain signing metadata from `<domain_url>/.well-known/openid-configuration`, reads the discovered issuer and JWKS URI, and validates the same incoming JWT signature and registered claims.
+6. During construction, TokenFactory reads `<domain_url>/.well-known/openid-configuration` once and retains an immutable snapshot containing the domain issuer, JWKS URI, token endpoint, and introspection endpoint. It uses the discovered issuer and JWKS URI to validate the same incoming JWT signature and registered claims.
 7. TokenFactory starts with the introspection claims, then overlays only the configured `groups_claim` from the validated JWT. This lets authorization use custom signed claims that introspection does not return.
 8. TokenFactory extracts the caller subject from `subject_claim` and caller groups from `groups_claim`.
 
-For `token_type="oauth"` with `credential=None`, TokenFactory does not run this caller assertion validation sequence. It resolves the selected hosting OAuth app from `client_key` and requests an application token directly with the OAuth client credentials grant.
+For `token_type="oauth"` with `credential=None`, TokenFactory still performs construction-time OIDC discovery but does not run caller assertion validation. It resolves the selected hosting OAuth app from `client_key` and requests an application token directly from the discovered token endpoint with the OAuth client credentials grant.
 
 ### Token Request Authorization
 
@@ -306,9 +306,9 @@ The module can load OAuth app credentials, signing material, certificates, and a
 Expected secret contents when Vault-backed sources are used through `oauth_apps` secret OCID fields:
 
 - `client_credentials_secret_ocid`: plain text `client_id:client_secret`
-- `private_key_secret_ocid`: PEM-encoded RSA private key
-- `private_key_passphrase_secret_ocid`: plain text private-key passphrase
-- `certificate_secret_ocid`: PEM-encoded X.509 certificate
+- `kms_key_id`: asymmetric OCI KMS key OCID
+- `kms_key_version_id`: exact key-version OCID matching the registered certificate
+- `kms_crypto_endpoint`: shared Vault cryptographic endpoint
 - `TF_SHARED_AUTHZ_POLICY_SECRET_OCID`: raw policy JSON or signed policy envelope JSON
 
 Notes:
@@ -348,7 +348,7 @@ Notes:
   Add `where target.secret.id = '<secret-ocid>'` to restrict a policy to a specific configured secret.
 
 - Factory-owned OCI SDK clients use Instance Principals by default. `TF_SHARED_OCI_AUTH_MODE=resource-principal` uses Resource Principals directly, and `TF_SHARED_OCI_AUTH_MODE=oci-profile` enables local OCI API-key profile fallback.
-- Vault reads are skipped for any material supplied directly through `OAuthClientInfo`, such as `client_credentials`, `private_key_path`, `private_key_pem`, `certificate_path`, or `certificate_pem`.
+- Hosting assertion signing never loads private-key PEM. `OAuthClientInfo` carries only KMS key/version metadata and the public `kid`.
 
 
 ### Shared runtime environment variables
@@ -357,7 +357,7 @@ These variables populate `TokenFactoryRuntimeConfig` or process-level TokenFacto
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `TF_SHARED_DOMAIN_URL` | yes | Identity Domain base URL, for example `https://<domain>.identity.oraclecloud.com:443`. Trailing slash is removed. |
+| `TF_SHARED_DOMAIN_URL` | yes | Identity Domain base URL, for example `https://<domain>.identity.oraclecloud.com:443`. TokenFactory removes trailing slashes and reads `/.well-known/openid-configuration` beneath this URL once during construction. |
 | `TF_SHARED_DOMAIN_REGION` | yes | OCI region used for UPST `TokenExchangeSigner` and Identity Data Plane calls. |
 | `TF_SHARED_TIMEOUT_SECONDS` | optional | HTTP timeout in seconds; default `30`. |
 | `TF_SHARED_OCI_AUTH_MODE` | optional | OCI auth mode for factory-owned OCI SDK clients: `instance-principal` (default), `resource-principal`, or `oci-profile`. Required in practice when Vault OCIDs must be read. |
@@ -403,14 +403,9 @@ Every `get_token(...)` call resolves the hosting OAuth app from the `oauth_apps`
 | `client_credentials` | yes, unless `client_credentials_secret_ocid` is set | Direct `client_id:client_secret`. |
 | `client_credentials_secret_ocid` | yes, unless `client_credentials` is set | Vault secret containing `client_id:client_secret`. |
 | `issuer` | yes for assertion-backed flows | JWT `iss` used when signing assertions for this hosting app. |
-| `private_key_pem` | one key source required for assertion-backed flows | Direct private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
-| `private_key_path` | one key source required for assertion-backed flows | Local private key path. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
-| `private_key_secret_ocid` | one key source required for assertion-backed flows | Vault secret containing private key PEM. Used by assertion-backed `oauth`, `oracle-database`, and `oci-service` flows; not resolved for OAuth client credentials mode. |
-| `private_key_passphrase` | optional | Direct private-key passphrase. |
-| `private_key_passphrase_secret_ocid` | optional | Vault secret containing the passphrase. |
-| `certificate_pem` | optional in resolver, required by Identity Domain setup | Direct certificate PEM matching the private key. |
-| `certificate_path` | optional | Local certificate path. |
-| `certificate_secret_ocid` | optional | Vault secret containing certificate PEM. |
+| `kms_key_id` | yes for assertion-backed flows | Asymmetric OCI KMS signing-key OCID. |
+| `kms_key_version_id` | yes for assertion-backed flows | Exact key-version OCID bound to the registered public certificate. |
+| `kms_crypto_endpoint` | yes for assertion-backed flows | OCI Vault cryptographic endpoint used by KMS Sign. |
 | `kid` | strongly recommended | JWT `kid` header and Identity Domain certificate alias. |
 | `resource_audiences` | yes for real caller-token validation | Accepted incoming caller assertion audiences for this hosting app. |
 | `required_incoming_scopes` | optional | Required scopes that must already be present in the incoming caller assertion. Bootstrap derives this from Terraform `oauth_apps[*].resource_scopes`. |
@@ -427,16 +422,20 @@ Important behavior details:
 - `get_token_with_oci_credential()` is a separate OAuth token-exchange API for OCI signer dictionaries or OCI CLI profile names. Current code does not validate an end-user assertion and does not run group/scope authorization for that API.
 - `TF_SHARED_CACHE_ENABLE=true` lets a TokenFactory instance reuse unexpired downstream OAuth, Oracle Database, OCI service signer, and OCI-credential OAuth results. Cache keys use request dimensions and credential fingerprints, opaque responses without a reliable expiration are not cached, and `TF_SHARED_CACHE_MAX_SIZE` bounds memory by evicting least recently used entries.
 - Vault-backed OAuth app values require the hosting runtime principal to read the referenced secrets.
-- Direct creds, local key files, and inline PEM/cert values avoid Vault reads for those materials.
+- Direct client credentials avoid a Vault Secret read, but assertion signing still requires OCI KMS.
 - `TF_SHARED_OCI_AUTH_MODE` and `TF_SHARED_OCI_AUTH_PROFILE` apply to factory-owned OCI clients generally, including Vault secret reads.
 
-Hybrid validation notes:
+Identity Domain discovery and hybrid validation notes:
 
 - TokenFactory always validates caller assertions with hybrid validation: Identity Domain introspection must return `active=true`, and the same incoming JWT must validate against the Identity Domain signing keys.
-- TokenFactory always discovers `issuer` and `jwks_uri` from `<domain_url>/.well-known/openid-configuration`; clients do not configure validation mode, issuer, JWKS URL, or a custom validator.
+- TokenFactory discovers `issuer`, `jwks_uri`, `token_endpoint`, and `introspection_endpoint` once during construction from `<domain_url>/.well-known/openid-configuration`. The immutable snapshot is reused for the factory lifetime; construct a new factory to refresh it.
+- Construction fails closed when discovery is unreachable, unsuccessful, malformed, incomplete, or contains a required URL that is not a safe absolute HTTPS URL.
+- `TF_SHARED_DOMAIN_REGION` remains explicit because standard OIDC metadata does not publish the Identity Domain home region. `TF_SHARED_OCI_REGION` remains the separate OCI workload/resource region.
+- `TF_CLIENT_ISSUER` remains explicit: it is the hosting application's assertion issuer and is not the Identity Domain issuer returned by discovery.
+- Clients do not configure token, introspection, JWKS, or Identity Domain validation-issuer overrides.
 - TokenFactory copies the configured `groups_claim` from the validated JWT into the trusted claims so authorization can use custom signed claims that introspection omits.
 - For a custom authorization claim such as `group`, set `TokenFactoryRuntimeConfig(groups_claim="group")` and keep authorization policy groups keyed by claim values such as `all_users`.
-- Runtime access to the Identity Domain discovery document and JWKS endpoint is required.
+- Runtime network access to the Identity Domain discovery document, discovered token and introspection endpoints, and JWKS endpoint is required.
 
 Signed authorization policy notes:
 
@@ -476,9 +475,9 @@ factory = TokenFactory(
         "orders-api": {
             "client_credentials_secret_ocid": "ocid1.vaultsecret.oc1..<orders-client-credentials>",
             "issuer": "https://orders-api.example.com/token-factory",
-            "private_key_secret_ocid": "ocid1.vaultsecret.oc1..<orders-private-key>",
-            "private_key_passphrase_secret_ocid": None,
-            "certificate_secret_ocid": "ocid1.vaultsecret.oc1..<orders-certificate>",
+            "kms_key_id": "ocid1.key.oc1..<orders-signing-key>",
+            "kms_key_version_id": "ocid1.keyversion.oc1..<orders-signing-key-version>",
+            "kms_crypto_endpoint": "https://<vault>-crypto.kms.us-chicago-1.oraclecloud.com",
             "kid": "orders-api-token-factory-cert",
             "resource_audiences": ["orders-api"],
             "required_incoming_scopes": ["orders-api.invoke"],
@@ -508,8 +507,9 @@ factory = TokenFactory(
         "orders-api": {
             "client_credentials_secret_ocid": "ocid1.vaultsecret.oc1..<orders-client-credentials>",
             "issuer": "https://orders-api.example.com/token-factory",
-            "private_key_secret_ocid": "ocid1.vaultsecret.oc1..<orders-private-key>",
-            "certificate_secret_ocid": "ocid1.vaultsecret.oc1..<orders-certificate>",
+            "kms_key_id": "ocid1.key.oc1..<orders-signing-key>",
+            "kms_key_version_id": "ocid1.keyversion.oc1..<orders-signing-key-version>",
+            "kms_crypto_endpoint": "https://<vault>-crypto.kms.us-chicago-1.oraclecloud.com",
             "kid": "orders-api-token-factory-cert",
             "resource_audiences": ["orders-api"],
             "required_incoming_scopes": ["orders-api.invoke"],

@@ -56,6 +56,12 @@ variable "identity_domain_region" {
   type        = string
 }
 
+variable "certificate_registration_python_command" {
+  description = "Python command used by the bootstrap-managed KMS certificate registration utility."
+  type        = string
+  default     = "python"
+}
+
 variable "enable_oci_secrets" {
   description = "When true, store OAuth app material in OCI Secrets and output secret OCIDs."
   type        = bool
@@ -78,18 +84,6 @@ variable "oci_master_key_existing_ocid" {
   description = "Existing Vault master encryption key OCID to use. When omitted and enable_oci_secrets is true, the module provisions a master key."
   type        = string
   default     = null
-}
-
-variable "oci_secrets_region" {
-  description = "Fallback region TokenFactory should use for OCI Secrets access when an OAuth app runtime does not set runtime.oci_region."
-  type        = string
-  default     = null
-}
-
-variable "restrict_secret_policy_to_secret_ocids" {
-  description = "When true, generated per-runtime Vault read policies include where clauses for individual secret OCIDs."
-  type        = bool
-  default     = false
 }
 
 variable "token_factory_timeout_seconds" {
@@ -179,32 +173,36 @@ variable "oauth_apps" {
     allowed_scopes       = optional(list(string), [])
     app_roles            = optional(list(string), [])
 
-    runtime = object({
-      principal_type   = string
-      compartment_ocid = string
-      resource_ocid    = optional(string, null)
-      oci_auth_profile = optional(string, null)
-      oci_region       = optional(string, null)
-      database_access = optional(object({
-        target_database_compartment_ocid = string
-        target_database_ocid             = string
-      }), null)
-    })
+    compute_runtime = optional(object({
+      instance_ocid = string
+    }), null)
+    function_runtime = optional(object({
+      function_ocid = string
+    }), null)
+    oke_runtime = optional(object({
+      cluster_ocid    = string
+      namespace       = string
+      service_account = string
+    }), null)
+    local_runtime = optional(object({
+      oci_auth_profile = optional(string, "DEFAULT")
+    }), null)
+    database_access = optional(object({
+      target_database_compartment_ocid = string
+      target_database_ocid             = string
+    }), null)
 
     enable_identity_propagation_trust = optional(bool, true)
     propagation_trust_claim_name      = optional(string, null)
     propagation_trust_claim_value     = optional(string, null)
 
-    jwt_key_material_source = optional(string, "generate")
-
-    jwt_private_key_pem                     = optional(string, null)
-    jwt_private_key_passphrase              = optional(string, null)
-    jwt_certificate_pem                     = optional(string, null)
-    jwt_certificate_pem_for_identity_domain = optional(string, null)
-
-    private_key_secret_existing_ocid            = optional(string, null)
-    private_key_passphrase_secret_existing_ocid = optional(string, null)
-    certificate_secret_existing_ocid            = optional(string, null)
+    signing_key = object({
+      mode                     = string
+      signing_key_ocid         = optional(string, null)
+      signing_key_version_ocid = optional(string, null)
+      signing_certificate_pem  = optional(string, null)
+      signing_certificate_path = optional(string, null)
+    })
   }))
   default = {}
 
@@ -216,33 +214,66 @@ variable "oauth_apps" {
       trimspace(component.display_name) != "" &&
       trimspace(component.issuer) != "" &&
       trimspace(component.kid) != "" &&
+      can(regex("^[A-Za-z0-9._-]+$", component.kid)) &&
       length(component.resource_audiences) > 0
     ])
-    error_message = "Each oauth_apps key must be non-empty and uppercase; display_name, issuer, kid, and resource_audiences must be non-empty."
+    error_message = "Each oauth_apps key must be non-empty and uppercase; display_name, issuer, and resource_audiences must be non-empty; kid must use only letters, digits, dot, underscore, and hyphen."
   }
 
   validation {
     condition = alltrue([
       for component in var.oauth_apps :
-      contains(["compute-instance", "oci-function", "oke-cluster", "user-group"], component.runtime.principal_type)
+      length(compact([
+        component.compute_runtime != null ? "compute" : null,
+        component.function_runtime != null ? "function" : null,
+        component.oke_runtime != null ? "oke" : null,
+        component.local_runtime != null ? "local" : null,
+      ])) == 1
     ])
-    error_message = "oauth_apps[*].runtime.principal_type must be one of compute-instance, oci-function, oke-cluster, or user-group."
+    error_message = "Exactly one of compute_runtime, function_runtime, oke_runtime, or local_runtime must be configured for each oauth_apps entry."
   }
 
   validation {
     condition = alltrue([
       for component in var.oauth_apps :
-      trimspace(component.runtime.compartment_ocid) != ""
+      (component.compute_runtime == null || try(trimspace(component.compute_runtime.instance_ocid), "") != "") &&
+      (component.function_runtime == null || try(trimspace(component.function_runtime.function_ocid), "") != "") &&
+      (component.oke_runtime == null || (try(trimspace(component.oke_runtime.cluster_ocid), "") != "" && try(trimspace(component.oke_runtime.namespace), "") != "" && try(trimspace(component.oke_runtime.service_account), "") != "")) &&
+      (component.local_runtime == null || try(trimspace(component.local_runtime.oci_auth_profile), "") != "")
     ])
-    error_message = "oauth_apps[*].runtime.compartment_ocid must not be empty."
+    error_message = "Runtime identifiers and local_runtime.oci_auth_profile must not be empty."
   }
 
   validation {
     condition = alltrue([
       for component in var.oauth_apps :
-      contains(["generate", "provided_pem", "existing_secret_ocids"], component.jwt_key_material_source)
+      contains(["BOOTSTRAP_MANAGED", "EXTERNALLY_MANAGED"], component.signing_key.mode)
     ])
-    error_message = "oauth_apps[*].jwt_key_material_source must be one of generate, provided_pem, or existing_secret_ocids."
+    error_message = "oauth_apps[*].signing_key.mode must be BOOTSTRAP_MANAGED or EXTERNALLY_MANAGED."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.signing_key.mode != "BOOTSTRAP_MANAGED" || (
+        component.signing_key.signing_key_ocid == null &&
+        component.signing_key.signing_certificate_pem == null &&
+        component.signing_key.signing_certificate_path == null
+      )
+    ])
+    error_message = "BOOTSTRAP_MANAGED signing keys must not provide a key OCID or certificate input; an explicitly rotated version OCID is allowed."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.signing_key.mode != "EXTERNALLY_MANAGED" || (
+        try(trimspace(component.signing_key.signing_key_ocid), "") != "" &&
+        try(trimspace(component.signing_key.signing_key_version_ocid), "") != "" &&
+        (component.signing_key.signing_certificate_pem != null) != (component.signing_key.signing_certificate_path != null)
+      )
+    ])
+    error_message = "EXTERNALLY_MANAGED signing keys require key OCID, exact key-version OCID, and exactly one certificate PEM or path."
   }
 
   validation {
@@ -257,28 +288,19 @@ variable "oauth_apps" {
   validation {
     condition = alltrue([
       for component in var.oauth_apps :
-      component.runtime.database_access == null ||
-      component.runtime.principal_type != "user-group"
+      component.database_access == null ? true :
+      trimspace(component.database_access.target_database_compartment_ocid) != ""
     ])
-    error_message = "oauth_apps[*].runtime.database_access requires a dynamic-group runtime; user-group runtimes are not supported."
+    error_message = "oauth_apps[*].database_access.target_database_compartment_ocid must not be empty."
   }
 
   validation {
     condition = alltrue([
       for component in var.oauth_apps :
-      component.runtime.database_access == null ||
-      trimspace(component.runtime.database_access.target_database_compartment_ocid) != ""
+      component.database_access == null ? true :
+      trimspace(component.database_access.target_database_ocid) != ""
     ])
-    error_message = "oauth_apps[*].runtime.database_access.target_database_compartment_ocid must not be empty."
-  }
-
-  validation {
-    condition = alltrue([
-      for component in var.oauth_apps :
-      component.runtime.database_access == null ||
-      trimspace(component.runtime.database_access.target_database_ocid) != ""
-    ])
-    error_message = "oauth_apps[*].runtime.database_access.target_database_ocid must not be empty."
+    error_message = "oauth_apps[*].database_access.target_database_ocid must not be empty."
   }
 
   validation {
@@ -333,7 +355,7 @@ variable "oauth_apps" {
 }
 
 variable "output_provisioned_resources" {
-  description = "When true, outputs provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database setup commands."
+  description = "When true, outputs provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database requirement guidance."
   type        = bool
   default     = false
 }
