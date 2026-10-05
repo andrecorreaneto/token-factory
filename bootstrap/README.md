@@ -94,6 +94,7 @@ Map keys are the canonical Token Factory `CallerContext.client_key` values and m
 | `resource_scopes` | No | Incoming Identity Domain resource-server scopes. Non-empty values make the Identity Domain app an OAuth resource. |
 | `allowed_scopes` | No | OAuth client authorized scopes for the Identity Domain app. Values must be Identity Domain FQS strings. Apps with allowed scopes are created after scope-independent apps so module-managed resource scopes exist first. |
 | `app_roles` | No | Identity Domain app-role grants for the OAuth app. Defaults to no grants. |
+| `allowed_clients` | No | Other `oauth_apps` keys whose OAuth clients may call this app. The module resolves them to client IDs and emits `allowed_client_ids` / `TF_CLIENT_ALLOWED_CLIENT_IDS`. Omit it to leave the runtime client check off. The app always accepts its own client ID, so `[]` means "only this app". Clients outside this module are configured on the runtime `allowed_client_ids` directly. |
 | `compute_runtime` | Exactly one runtime | Exact Compute workload object containing `instance_ocid`. |
 | `function_runtime` | Exactly one runtime | Exact Functions workload object containing `function_ocid`. |
 | `oke_runtime` | Exactly one runtime | OKE workload identity containing `cluster_ocid`, `namespace`, and `service_account`. |

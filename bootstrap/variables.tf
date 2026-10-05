@@ -172,6 +172,7 @@ variable "oauth_apps" {
     resource_scopes      = optional(list(string), [])
     allowed_scopes       = optional(list(string), [])
     app_roles            = optional(list(string), [])
+    allowed_clients      = optional(list(string), null)
 
     compute_runtime = optional(object({
       instance_ocid = string
@@ -311,6 +312,17 @@ variable "oauth_apps" {
       ]
     ]))
     error_message = "oauth_apps[*].allowed_scopes values must not be empty."
+  }
+
+  validation {
+    condition = alltrue([
+      for component in var.oauth_apps :
+      component.allowed_clients == null ? true : (
+        length(component.allowed_clients) == length(distinct(component.allowed_clients)) &&
+        alltrue([for caller in component.allowed_clients : contains(keys(var.oauth_apps), caller)])
+      )
+    ])
+    error_message = "oauth_apps[*].allowed_clients must contain unique oauth_apps keys."
   }
 
   validation {

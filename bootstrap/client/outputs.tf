@@ -45,6 +45,7 @@ output "clients_runtime_config_exports" {
         TF_CLIENT_RESOURCE_AUDIENCES       = join(",", lookup(config.oauth_client_config, "resource_audiences", []))
         TF_CLIENT_REQUIRED_INCOMING_SCOPES = length(lookup(config.oauth_client_config, "required_incoming_scopes", [])) == 0 ? null : join(",", lookup(config.oauth_client_config, "required_incoming_scopes", []))
         TF_CLIENT_PROPAGATION_TRUST_CLAIM  = lookup(config.oauth_client_config, "propagation_trust_claim", null)
+        TF_CLIENT_ALLOWED_CLIENT_IDS       = lookup(config.oauth_client_config, "allowed_client_ids", null) == null ? null : join(",", lookup(config.oauth_client_config, "allowed_client_ids", null))
       } :
       "export ${key}=${jsonencode(tostring(value))}"
       if value != null

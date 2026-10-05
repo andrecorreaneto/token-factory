@@ -6,6 +6,7 @@ from ._factory_support import (
     _fetch_secret_value_from_oci,
     _parse_token_factory_credentials,
 )
+from ._normalization import normalize_unique_strings
 from ._runtime_config import TokenFactoryRuntimeConfig
 
 
@@ -21,6 +22,8 @@ class OAuthClientInfo:
     propagation_trust_claim: Optional[str] = None
     resource_audiences: List[str] = field(default_factory=list)
     required_incoming_scopes: List[str] = field(default_factory=list)
+    # None disables the client check; a list (even empty) enables it, and the hosting app's own client ID is always allowed.
+    allowed_client_ids: Optional[List[str]] = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,7 @@ class ResolvedHostingComponent:
     resource_audiences: List[str]
     propagation_trust_claim: Optional[str] = None
     required_incoming_scopes: List[str] = field(default_factory=list)
+    allowed_client_ids: Optional[List[str]] = None
 
 
 class OAuthClientResolver:
@@ -96,6 +100,7 @@ class StaticOAuthClientResolver(OAuthClientResolver):
             resource_audiences=list(info.resource_audiences),
             propagation_trust_claim=info.propagation_trust_claim,
             required_incoming_scopes=list(info.required_incoming_scopes),
+            allowed_client_ids=None if info.allowed_client_ids is None else normalize_unique_strings(info.allowed_client_ids),
         )
 
 

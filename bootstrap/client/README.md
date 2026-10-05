@@ -33,6 +33,9 @@ oauth_apps = {
     allowed_scopes     = []
     app_roles          = []
 
+    # Optional. Other oauth_apps keys allowed to call this app; the app itself is always allowed.
+    # allowed_clients = ["AGENT"]
+
     compute_runtime = {
       instance_ocid = "ocid1.instance.oc1..compute"
     }

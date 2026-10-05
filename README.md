@@ -157,7 +157,7 @@ TokenFactory is essentially a helper library that hides the complexity of token 
 2. TokenFactory uses `client_key` to select the hosting application's OAuth app config, including client credentials, JWT signing material, resource audiences, and required incoming scopes.
 3. TokenFactory introspects the incoming caller token at the Identity Domain `introspection_endpoint` returned by OIDC discovery, authenticating with the resolved hosting app OAuth client.
 4. The introspection response must return `active=true`. If the token is inactive, unrecognized, expired, or otherwise invalid, TokenFactory fails closed.
-5. TokenFactory checks the introspection result against the resolved resource-server config: `aud` must match `resource_audiences`, and the incoming token scopes must include `required_incoming_scopes` when configured.
+5. TokenFactory checks the introspection result against the resolved resource-server config: `aud` must match `resource_audiences`, and the incoming token scopes must include `required_incoming_scopes` when configured. Audience and scope establish that the token was meant for this app. When `allowed_client_ids` is configured, the introspected `client_id` must also be the app itself or a listed client, which establishes who sent it. A missing `client_id` fails closed.
 6. During construction, TokenFactory reads `<domain_url>/.well-known/openid-configuration` once and retains an immutable snapshot containing the domain issuer, JWKS URI, token endpoint, and introspection endpoint. It uses the discovered issuer and JWKS URI to validate the same incoming JWT signature and registered claims.
 7. TokenFactory starts with the introspection claims, then overlays only the configured `groups_claim` from the validated JWT. This lets authorization use custom signed claims that introspection does not return.
 8. TokenFactory extracts the caller subject from `subject_claim` and caller groups from `groups_claim`.
@@ -222,6 +222,7 @@ Operational notes:
 - The Vault secret value must be exactly `client_id:client_secret`.
 - For incoming caller assertion validation, configure the app as a resource server and issue caller tokens with an audience that appears in `OAuthClientInfo.resource_audiences`.
 - If `OAuthClientInfo.required_incoming_scopes` is set, the incoming caller assertion must already contain those scopes in `scope` or `scp`.
+- If `OAuthClientInfo.allowed_client_ids` is set, the incoming caller assertion must have been issued to one of those OAuth clients, or to the hosting app itself.
 - For UPST-backed flows (`oracle-database` with a caller assertion, and `oci-service`), the selected app client ID must also be listed in the `oauthClients` array of the `IdentityPropagationTrust`.
 - If the Identity Domain token endpoint starts returning `400 invalid_scope`, verify that the selected OAuth app owns the requested resource scope and that the caller application is allowed to request it. For resource scopes, the request often uses the fully qualified form such as `https://playground.mcp.server/tools.get_user_info`, while the issued access token may contain only `tools.get_user_info`.
 - If the Identity Domain token endpoint starts returning `400 invalid_request` after scope changes, verify the selected OAuth app grants, certificate alias, and JWT assertion configuration.
@@ -409,6 +410,7 @@ Every `get_token(...)` call resolves the hosting OAuth app from the `oauth_apps`
 | `kid` | strongly recommended | JWT `kid` header and Identity Domain certificate alias. |
 | `resource_audiences` | yes for real caller-token validation | Accepted incoming caller assertion audiences for this hosting app. |
 | `required_incoming_scopes` | optional | Required scopes that must already be present in the incoming caller assertion. Bootstrap derives this from Terraform `oauth_apps[*].resource_scopes`. |
+| `allowed_client_ids` | optional | Identity Domain client IDs allowed to call this hosting app, matched against the incoming token's `client_id`. `None` (default) disables the check. A list enables it; the hosting app's own client ID is always allowed, because an app can be both a client and a resource server, so `[]` means "only this app". Bootstrap emits it from `oauth_apps[*].allowed_clients` as `TF_CLIENT_ALLOWED_CLIENT_IDS` (comma-separated; an empty string means `[]`). |
 
 Important behavior details:
 
