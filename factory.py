@@ -196,7 +196,7 @@ class TokenFactory:
             return self._get_oracle_database_token(credential, scope, resolved_client_key)
         if token_type == "userid":
             return self._get_userid_token(credential, resolved_client_key)
-        return self._get_oci_service_token(credential, resolved_client_key)
+        return self._get_oci_service_token(credential, scope, resolved_client_key)
 
     def get_token_with_oci_credential(self, credential: Credential, scope: Optional[str] = None) -> Dict[str, Any]:
         """Exchange an OCI signer dictionary or profile name for an OAuth token."""
@@ -287,9 +287,17 @@ class TokenFactory:
         context = self._validate_assertion(assertion, client_key)
         return {"issued_token_type": "userid", "user_id": context.subject}
 
-    def _get_oci_service_token(self, credential: Credential, client_key: str) -> Any:
+    def _get_oci_service_token(self, credential: Credential, scope: Optional[str], client_key: str) -> Any:
         assertion = _require_caller_assertion(credential, "oci-service")
+        # The scope is a policy label only: it gates who may obtain the signer, not what the signer may call in OCI.
+        requested_scope = None
+        if self._authz_policy_enable:
+            if not isinstance(scope, str) or not scope.strip():
+                raise ValueError("Scope is required for token_type 'oci-service' when TF_SHARED_AUTHZ_POLICY_ENABLE=true")
+            requested_scope = scope.strip()
         context = self._validate_assertion(assertion, client_key)
+        if requested_scope is not None:
+            self._authorize(context, "oci-service", requested_scope)
         cache_key = _cache_key("oci-service", client_key, _secret_fingerprint(assertion))
         cached = self._get_cached_result(cache_key, "oci-service")
         if cached is not None:

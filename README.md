@@ -1,540 +1,321 @@
 # Token Factory
 
-`TokenFactory` is a small client library that converts an incoming caller credential into the exact credential format a downstream target needs. Instead of making every client implement its own JWT assertion signing, Identity Domain token exchange, UPST handling, Vault secret retrieval, and OCI signer setup, this module provides focused entry points through `TokenFactory.get_token()` and `TokenFactory.get_token_with_oci_credential()`.
+Token Factory is a Python library for applications that act on behalf of a user, such as an MCP server or an AI agent. The application receives the user's access token and needs a different credential for the next hop: an OAuth token for another API, a token for an Oracle Database, or a signer for OCI APIs. Token Factory checks the incoming token and then produces the credential the next hop expects.
 
-This is important because the supported targets do not all consume the same kind of credential. Some consumers need an OAuth access token, some need a user identifier, some need an OCI `TokenExchangeSigner`, and Oracle Database flows need a scoped database token plus the matching session key material. `TokenFactory` centralizes those translations so that clients can stay small, reuse the same security configuration, and avoid duplicating fragile trust, certificate, and secret-management logic across multiple services or scripts.
+Without it, every application would implement its own token validation, assertion signing, Identity Domain token exchange, Vault secret reads, and OCI signer setup. Token Factory keeps that logic, and its security configuration, in one place.
 
-TokenFactory exposes two credential-exchange APIs. Use `get_token()` for hosting-application OAuth flows: either assertion-backed on-behalf-of style exchanges with an incoming caller assertion, or an application-only OAuth client credentials exchange. Use `get_token_with_oci_credential()` when you have an OCI signer dictionary or OCI CLI profile and need an OAuth access token.
+## Key concepts
 
-Most deployments embed TokenFactory in one running component, such as an agent or MCP server, and configure one hosting OAuth app for that process. Use the same structured shape for every deployment: pass an `oauth_apps` map to `TokenFactory(...)` and pass `client_key` to `get_token(...)`. A single-client process is just an `oauth_apps` map with one entry.
+- **Hosting app**: the application that embeds Token Factory, for example your MCP server. Each hosting app has its own OAuth app (client) in the OCI IAM Identity Domain. Token Factory acts as that OAuth app when it talks to the Identity Domain. Token Factory itself is not an OAuth client.
+- **`oauth_apps` and `client_key`**: you describe each hosting app in an `oauth_apps` map when you create the factory, and name the one to use with `client_key` on every call. Most processes have exactly one entry.
+- **Caller token**: the access token your application received from its caller. Token Factory validates it before trusting anything in it.
+- **Token type**: what you want back. One of `oauth`, `oracle-database`, `oci-service`, or `userid`.
+- **Two different scopes**: the `scope` you pass to `get_token` is what you are asking for *downstream*. The `required_incoming_scopes` setting is what the *incoming* caller token must already carry. They are unrelated.
+- **Validation and authorization**: validation decides whether the caller token is genuine, meant for this app, and sent by an allowed client. Authorization, which is optional, decides whether the user's groups may request the downstream scope.
+- **Bootstrap**: a [Terraform module](./bootstrap/) that provisions the Identity Domain apps, keys, trusts, Vault secrets, and IAM policies, and outputs the configuration this library needs.
 
-## get_token API
+## Choosing a token type
 
-The main client entry point is:
+| You need | `token_type` | `credential` | `scope` | You get back |
+| --- | --- | --- | --- | --- |
+| An OAuth token for another API, on behalf of the user | `oauth` | caller token | required | dict with `token` |
+| An OAuth token for the hosting app itself, with no user | `oauth` | `None` | required | dict with `token` |
+| An Oracle Database token for the user | `oracle-database` | caller token | required (database scope) | tuple `(token, private_key_pem, ...)` |
+| An Oracle Database token for the workload's own OCI identity | `oracle-database` | `"OCI_PRINCIPAL"` | required (database scope) | tuple `(token, private_key_pem, ...)` |
+| An OCI SDK signer that calls OCI APIs as the user | `oci-service` | caller token | required only when authorization is on | OCI `TokenExchangeSigner` |
+| Just the validated user ID | `userid` | caller token | not used | dict with `user_id` |
+
+Use the separate `get_token_with_oci_credential()` API when you hold an OCI API key or OCI CLI profile and need an OAuth token. See [get_token_with_oci_credential](#get_token_with_oci_credential).
+
+## Quick start
+
+1. **Provision the prerequisites** with the [bootstrap module](./bootstrap/), usually through its [client folder](./bootstrap/client/). It outputs two sets of values: shared settings (`TF_SHARED_*`) and per-app settings (`TF_CLIENT_*`).
+
+2. **Set the shared settings** as environment variables of the hosting application:
+
+   ```sh
+   export TF_SHARED_DOMAIN_URL="https://<domain>.identity.oraclecloud.com:443"
+   export TF_SHARED_DOMAIN_REGION="us-chicago-1"
+   export TF_SHARED_GROUPS_CLAIM="group"
+   ```
+
+3. **Describe the hosting app.** Token Factory does not read `TF_CLIENT_*` variables itself; your application maps them into an `oauth_apps` entry (see the [mapping table](#mapping-bootstrap-outputs-to-oauth_apps)):
+
+   ```python
+   from token_factory import TokenFactory
+
+   factory = TokenFactory(
+       oauth_apps={
+           "ORDERS-API": {
+               "client_credentials_secret_ocid": "ocid1.vaultsecret.oc1..<orders-client-credentials>",
+               "issuer": "https://orders-api.example.com/token-factory",
+               "kid": "orders-api-token-factory-cert",
+               "kms_key_id": "ocid1.key.oc1..<orders-signing-key>",
+               "kms_key_version_id": "ocid1.keyversion.oc1..<orders-signing-key-version>",
+               "kms_crypto_endpoint": "https://<vault>-crypto.kms.us-chicago-1.oraclecloud.com",
+               "resource_audiences": ["https://orders-api.example.com/"],
+               "required_incoming_scopes": ["invoke"],
+               "allowed_client_ids": ["<agent-client-id>"],
+           }
+       }
+   )
+   ```
+
+   Creating the factory reads the shared settings and contacts the Identity Domain once to discover its endpoints. Create one factory per process and reuse it.
+
+4. **Request a token:**
+
+   ```python
+   from token_factory import AuthorizationError, CallerAssertionValidationError
+
+   try:
+       result = factory.get_token(
+           caller_access_token,
+           "oauth",
+           "https://inventory-api.example.com/inventory.read",
+           client_key="ORDERS-API",
+       )
+       downstream_token = result["token"]
+   except CallerAssertionValidationError:
+       ...  # the caller token was rejected: respond 401
+   except AuthorizationError:
+       ...  # the user's groups may not request this scope: respond 403
+   ```
+
+## get_token
 
 ```python
-factory = TokenFactory(oauth_apps=oauth_apps)
-result = factory.get_token(
-    credential,
-    token_type,
-    scope=None,
-    client_key="orders-api",
-)
+result = factory.get_token(credential, token_type, scope=None, client_key="ORDERS-API")
 ```
-
-`TokenFactory(oauth_apps=...)` loads the process runtime configuration and configured hosting OAuth apps once. `get_token()` then performs either an assertion-backed exchange for the requested downstream target or, for `token_type="oauth"` with `credential=None`, an OAuth client credentials exchange for the selected hosting app. Always pass `client_key=...` so TokenFactory selects the correct hosting app OAuth identity and resource-server validation settings.
-
-Credentials that refer to OCI signer dictionaries and OCI CLI profile names do not flow through `get_token()`. They should use `get_token_with_oci_credential()` instead.
-
-### Parameters
 
 | Parameter | Required | Description |
 | --- | --- | --- |
-| `credential` | depends on flow | Incoming caller assertion string, usually an Identity Domain access token for the hosting application. Pass `None` only for `token_type="oauth"` when requesting an application-only client credentials token. For `token_type="oracle-database"`, the reserved string `OCI_PRINCIPAL` requests an OCI instance/resource principal database token, and `PROCESS` is reserved for future RPST support. |
-| `token_type` | yes | The requested output type. Supported values are `oracle-database`, `oci-service`, `oauth`, and `userid`. |
-| `scope` | depends on flow | Required for `oauth` and `oracle-database`. Not used for `userid` or `oci-service`. |
-| `client_key` | yes | Key into the configured `oauth_apps` map. Required even when the map has one entry. |
+| `credential` | yes | The caller token. Use `None` only for `oauth` without a user, and `"OCI_PRINCIPAL"` only for `oracle-database` with the workload's own identity. |
+| `token_type` | yes | `oauth`, `oracle-database`, `oci-service`, or `userid`. |
+| `scope` | depends | Required for `oauth` and `oracle-database`. Required for `oci-service` when authorization is on. Not used for `userid`. |
+| `client_key` | yes | The `oauth_apps` key of the hosting app, even when there is only one. |
 
-### Accepted `credential` shapes
+### oauth
 
-| Credential shape | Supported flows | Notes |
-| --- | --- | --- |
-| Incoming assertion string | `oauth`, `userid`, `oracle-database`, `oci-service` | TokenFactory validates this assertion before trusting `sub`, groups, audience, or incoming scopes. |
-| `OCI_PRINCIPAL` | `oracle-database` | TokenFactory uses the configured OCI instance/resource principal to request the database token. `TF_SHARED_OCI_AUTH_MODE` defaults to `instance-principal` and may be set to `resource-principal`. |
-| `PROCESS` | `oracle-database` | Reserved for future RPST process-principal database tokens. The selector currently raises a not-implemented error. |
-| `None` | `oauth` only | TokenFactory requests an application token with the OAuth `client_credentials` grant. There is no end-user assertion to validate and no end-user subject or group authorization context. |
+With a caller token, Token Factory validates it, checks authorization when enabled, and then:
 
-### Return value
+- returns the caller's token unchanged if it already has the requested scope and the matching audience, so no new token is needed; the result then includes `"source": "incoming_token"`;
+- otherwise exchanges it at the Identity Domain for a new token issued for the same user, using an assertion signed by the hosting app's KMS key (the JWT bearer grant).
 
-`get_token()` returns different result types depending on `token_type`:
+With `credential=None`, there is no user. Token Factory requests a token for the hosting app itself with its client ID and secret (the client credentials grant). No validation, authorization, or signing takes place.
 
-- `oracle-database`: a tuple containing `(token, private_key_pem, expires_in, token_type, issued_token_type)`; the token and private key are always the first two elements
-- `oci-service`: an OCI `TokenExchangeSigner`
-- `oauth`: a dictionary containing `token`, `expires_in`, `token_type`, and `issued_token_type`
-- `userid`: a dictionary containing `user_id` and `issued_token_type`
+Pass `scope` in the form the Identity Domain expects, usually the fully qualified scope, such as `https://inventory-api.example.com/inventory.read`.
 
-### Supported Flows
+The result is a dict with `token` (also available as `access_token`), `expires_in`, `token_type`, and `issued_token_type="oauth"`.
 
-Once you know the downstream consumer, selecting a flow is straightforward:
-
-- Choose `oracle-database` when the caller needs a scoped Oracle Database token and the matching session private key material.
-- Choose `oci-service` when the caller needs an OCI SDK signer rather than a bearer token string.
-- Choose `oauth` with an incoming caller assertion when the downstream system expects a regular OAuth access token on behalf of a validated caller.
-- Choose `oauth` with `credential=None` when the downstream system expects an application-only OAuth access token using the selected hosting OAuth app's client credentials.
-- Choose `userid` when the caller only needs the resolved subject identifier and does not need to keep the exchanged token.
-
-The table below is a quick handout for clients integrating with the library. It shows what input each flow expects, what comes back, and which external trust or OCI components are involved.
-
-| `token_type` | Accepted credential types | Extra input | Returned token or value | Main upstream dependencies |
-| --- | --- | --- | --- | --- |
-| `oracle-database` | incoming caller assertion string | downstream `scope` required | Oracle Database scoped access token plus session private key as the first two tuple elements | Incoming token validation, optional group-scope authorization, JWT assertion signing, IdentityPropagationTrust, `TokenExchangeSigner`, Identity Data Plane `generate_scoped_access_token` |
-| `oracle-database` | `OCI_PRINCIPAL` | downstream `scope` required | Oracle Database scoped access token plus session private key as the first two tuple elements | Configured OCI instance/resource principal signer, Identity Data Plane `generate_scoped_access_token` |
-| `oci-service` | incoming caller assertion string | no scope | OCI `TokenExchangeSigner` backed by a UPST, not a raw token string | Incoming token validation, JWT assertion signing, IdentityPropagationTrust, `TokenExchangeSigner` |
-| `oauth` | incoming caller assertion string | downstream `scope` required | OAuth access token in the response payload (`issued_token_type=oauth`) | Incoming token validation, optional group-scope authorization, Identity Domain `/oauth2/v1/token` JWT bearer grant |
-| `oauth` | `None` | downstream `scope` required | OAuth access token in the response payload (`issued_token_type=oauth`) | Identity Domain `/oauth2/v1/token` client credentials grant using the selected OAuth app client ID and client secret |
-| `userid` | incoming caller assertion string | no scope | extracted `user_id` from the validated incoming assertion (`issued_token_type=userid`) | Incoming token validation only |
-
-#### OAuth assertion versus client credentials modes
-
-`token_type="oauth"` supports two distinct modes:
-
-- **Assertion-backed / OBO mode**: pass a non-empty incoming caller assertion string. TokenFactory validates the caller token, optionally authorizes the requested downstream scope, and either passes the incoming OAuth token through or exchanges a signed JWT bearer assertion for a downstream OAuth token.
-- **Client credentials mode**: pass `credential=None`. TokenFactory skips end-user assertion validation and group-scope authorization because there is no end user in this flow. It sends `grant_type=client_credentials` with the requested `scope` and authenticates the selected hosting OAuth app with its `client_id:client_secret`.
-
-Client credentials mode does not involve private-key cryptographic operations. It does not sign JWT assertions, load a private key into a crypto backend, create a UPST signer, or use IdentityPropagationTrust. It only uses the selected OAuth app's client credentials against the Identity Domain token endpoint. If the same `oauth_apps` entry is also used for assertion-backed, `oracle-database`, or `oci-service` flows, that entry may still carry private-key and certificate configuration for those other flows.
-
-#### Oracle Database principal selectors
-
-`token_type="oracle-database"` supports two principal modes through the `credential` argument:
+### oracle-database
 
 ```python
-# User-scoped database token through the existing UPST path.
-factory.get_token("oracle-database", caller_jwt, db_scope, client_key="MCP_SERVER")
+# As the user, through the user's OCI identity.
+result = factory.get_token(caller_access_token, "oracle-database", db_scope, client_key="ORDERS-API")
 
-# OCI instance/resource principal database token.
-factory.get_token("oracle-database", "OCI_PRINCIPAL", db_scope, client_key="MCP_SERVER")
+# As the workload's own OCI identity (instance, resource principal, OKE workload, or profile).
+result = factory.get_token("OCI_PRINCIPAL", "oracle-database", db_scope, client_key="ORDERS-API")
+
+token, private_key_pem = result[0], result[1]
 ```
 
-`OCI_PRINCIPAL` is case-insensitive and uses the factory's configured OCI signer: instance principal, resource principal, OKE workload identity, or OCI profile. The reserved selector `PROCESS` is intentionally not implemented.
+With a caller token, Token Factory exchanges the user's identity for an OCI user session through the hosting app's IdentityPropagationTrust, then requests a database token for `scope`. With `"OCI_PRINCIPAL"` (case-insensitive), it uses the workload's OCI identity directly, with no caller token, validation, or authorization. `"PROCESS"` is reserved and currently raises `NotImplementedError`.
 
-Oracle Database results still unpack as `(token, private_key_pem, expires_in, token_type, issued_token_type)`. They also expose `principal_mode` and `expires_at_epoch` attributes for connection-pool lifecycle decisions. Pool keys for OCI-principal database tokens should include the connect target, database token scope, and principal mode, and pools should be retired before `expires_at_epoch`.
+The result unpacks as `(token, private_key_pem, expires_in, token_type, issued_token_type)`. It also has `principal_mode` (`user` or `oci_principal`) and `expires_at_epoch` attributes. If you pool database connections, key the pool by connect target, scope, and principal mode, and retire connections before `expires_at_epoch`.
 
-### Validation and common errors
+### oci-service
 
-- Unsupported `token_type` values raise `ValueError`.
-- `oauth` and `oracle-database` raise `ValueError` if `scope` is missing.
-- `get_token()` raises `ValueError` if `credential` is not a non-empty caller assertion string, except for the explicit `token_type="oauth"` client credentials mode where `credential=None` is valid and `token_type="oracle-database"` where `credential="OCI_PRINCIPAL"` is valid.
-- `CallerAssertionValidationError` maps to invalid incoming caller assertions.
-- `AuthorizationError` maps to group-scope authorization denial when authorization policy enforcement is enabled.
-- Configuration issues raise `ConfigurationError`.
-- Upstream exchange or decode failures raise `TokenExchangeError`.
+Token Factory exchanges the user's identity for an OCI user session through the hosting app's IdentityPropagationTrust and returns an OCI SDK signer. OCI clients built with this signer call OCI APIs as the user, and OCI IAM policies for that user decide what each call may do.
 
-## get_token_with_oci_credential API
+When authorization is on, `scope` is required. It is a label your application chooses, such as the name of the MCP tool that needs OCI access, and Token Factory checks it against the policy. It is never sent to OCI and does not limit the signer.
 
-Use `get_token_with_oci_credential()` only for OCI-authenticated OAuth token exchange. This API is separate from `get_token()` because it authenticates with OCI signer material instead of validating an incoming caller assertion.
+### userid
+
+Token Factory validates the caller token and returns `{"issued_token_type": "userid", "user_id": "<subject>"}`. Use it when you only need to know who the user is.
+
+### Errors
+
+| Error | Meaning | Typical response |
+| --- | --- | --- |
+| `CallerAssertionValidationError` | The caller token failed validation. | 401 |
+| `AuthorizationError` | The user's groups may not request this scope. | 403 |
+| `AuthorizationPolicyError` | The authorization policy could not be loaded or verified. | 500 |
+| `OAuthClientResolutionError` | Unknown `client_key`, or the app's configuration is incomplete. | 500 |
+| `ValueError` | Invalid arguments, such as an unsupported `token_type` or a missing `scope`. | 400 |
+| `ConfigurationError` | Invalid configuration, an unreadable Vault secret or OCI identity, or (when creating the factory) failed Identity Domain discovery. | 500 |
+| `TokenExchangeError` | The Identity Domain or OCI rejected an exchange, or its response could not be read. | 502 |
+
+## get_token_with_oci_credential
 
 ```python
 factory = TokenFactory()
-result = factory.get_token_with_oci_credential(
-    credential,
-    scope="urn:opc:idm:orders.read",
-)
+result = factory.get_token_with_oci_credential("DEFAULT", scope="urn:opc:idm:orders.read")
 ```
 
-### Parameters
+Exchanges OCI API-key credentials for an OAuth token. `credential` is either an OCI CLI profile name from `~/.oci/config`, or a dict with `tenancy`, `user`, `fingerprint`, `region`, and exactly one of `private_key_file`, `private_key_file_location`, or `private_key_content`. `scope` is optional.
 
-| Parameter | Required | Description |
-| --- | --- | --- |
-| `credential` | yes | OCI signer dictionary or OCI CLI profile name. |
-| `scope` | no | OAuth scope to request from the Identity Domain token endpoint. |
+This API does not use `oauth_apps` or `client_key`, and does not validate a caller token or check authorization. The result has the same shape as an `oauth` result.
 
-### Accepted `credential` shapes
+## How a caller token is validated
 
-| Credential shape | Supported flow | Notes |
-| --- | --- | --- |
-| OCI signer dictionary | OAuth token exchange | Must include `tenancy`, `user`, `fingerprint`, `region`, and exactly one of `private_key_file`/`private_key_file_location` or `private_key_content`. |
-| OCI CLI profile name | OAuth token exchange | Loaded from `~/.oci/config`, using the profile name string passed as `credential`. |
+Whenever a request carries the caller's access token, Token Factory validates that token before doing anything else. That covers `oauth` on behalf of a user, `oracle-database` with a caller token, `oci-service`, and `userid`. The checks answer five questions: is the token still valid, is it genuine, is it meant for this app, was it sent by an allowed client, and who is the user.
 
-### Return value
+1. **Pick the hosting app.** The request names the hosting app through `client_key`. Token Factory loads that app's settings: its OAuth client, the audiences and scopes it accepts, and the clients allowed to call it.
+2. **Ask the Identity Domain whether the token is still valid.** Token Factory sends the token to the Identity Domain, identifying itself as the hosting app. If the Identity Domain says the token is not active (expired, revoked, unknown, or malformed), the request is rejected.
+3. **Check that the token is meant for this app.** At least one of the token's audiences must be one of the app's `resource_audiences`.
+4. **Check that the token carries an accepted scope.** If the app has `required_incoming_scopes`, the token must carry at least one of them.
+5. **Check which client sent the token.** If the app has `allowed_client_ids`, the token's `client_id`, which identifies the OAuth client that obtained the token, must be the hosting app itself or one of the listed clients. A token that does not say which client obtained it is rejected. Without `allowed_client_ids`, any client is accepted.
+6. **Check that the token is genuine.** Token Factory verifies the token's signature against the Identity Domain's published signing keys and confirms that the Identity Domain issued it and that it has not expired. The signed token must also carry the configured groups claim. The audience, scope, and client checks above are applied to the signed token too, so the token passes only if both the Identity Domain's answer and the token's own signature agree.
+7. **Identify the user.** Token Factory reads the user from the subject claim (`sub` by default) and the user's groups from the groups claim, taking groups from the signed token because the Identity Domain's answer in step 2 does not include custom claims. A token with no subject is rejected.
 
-`get_token_with_oci_credential()` returns an OAuth result dictionary containing `token`, `expires_in`, `token_type`, and `issued_token_type`.
+Any failed check stops the request with `CallerAssertionValidationError`, and no downstream token is requested. The checks run on every request, even when Token Factory could reuse a cached result.
 
-### Validation and common errors
+What validation does not prove: an access token is a bearer token, so a copy of it works from anywhere until it expires. `client_id` tells you which OAuth client obtained the token, not which machine is presenting it.
 
-- Invalid OCI signer dictionaries raise `ValueError`.
-- Missing OCI CLI profiles or malformed OCI config files raise `ValueError`.
-- Upstream OAuth exchange failures raise `TokenExchangeError`.
-- This API does not validate an end-user assertion, does not use `client_key`, and does not run group-scope authorization.
+These checks are built into Token Factory. If you replace the built-in token validator with your own, Token Factory relies on yours to perform them.
 
+Requests without a caller token skip validation: `oauth` with `credential=None`, `oracle-database` with `"OCI_PRINCIPAL"`, and `get_token_with_oci_credential()`.
 
-## How TokenFactory Works
+## How authorization works
 
-TokenFactory is essentially a helper library that hides the complexity of token exchange on behalf of its importing clients. As such, before requesting a token, it validates the requesting credential. When `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, it also checks whether the subject in the credential is entitled to request the scope for `oauth` and `oracle-database` flows.
+Authorization is off by default. Turn it on with `TF_SHARED_AUTHZ_POLICY_ENABLE=true` to control which users may request which downstream scopes.
 
-### Credential Validation
+When it is on, every `oauth`, `oracle-database`, and `oci-service` request that carries a caller token is checked after validation:
 
-1. For assertion-backed flows, a client passes an incoming caller access token to `TokenFactory.get_token(...)`, along with the requested `token_type`, an optional downstream `scope`, and the required `client_key`.
-2. TokenFactory uses `client_key` to select the hosting application's OAuth app config, including client credentials, JWT signing material, resource audiences, and required incoming scopes.
-3. TokenFactory introspects the incoming caller token at the Identity Domain `introspection_endpoint` returned by OIDC discovery, authenticating with the resolved hosting app OAuth client.
-4. The introspection response must return `active=true`. If the token is inactive, unrecognized, expired, or otherwise invalid, TokenFactory fails closed.
-5. TokenFactory checks the introspection result against the resolved resource-server config: `aud` must match `resource_audiences`, and the incoming token scopes must include `required_incoming_scopes` when configured. Audience and scope establish that the token was meant for this app. When `allowed_client_ids` is configured, the introspected `client_id` must also be the app itself or a listed client, which establishes who sent it. A missing `client_id` fails closed.
-6. During construction, TokenFactory reads `<domain_url>/.well-known/openid-configuration` once and retains an immutable snapshot containing the domain issuer, JWKS URI, token endpoint, and introspection endpoint. It uses the discovered issuer and JWKS URI to validate the same incoming JWT signature and registered claims.
-7. TokenFactory starts with the introspection claims, then overlays only the configured `groups_claim` from the validated JWT. This lets authorization use custom signed claims that introspection does not return.
-8. TokenFactory extracts the caller subject from `subject_claim` and caller groups from `groups_claim`.
+- The request must include a `scope`; a missing scope is rejected.
+- Every requested scope must be granted to at least one of the user's groups. The user's groups count together, so different groups can grant different scopes. The decision depends only on groups, not on who the user is.
+- Scopes must match the policy exactly, so grant a fully qualified scope if that is what your application requests.
+- Grants are listed per token type: a scope granted under `oauth` does not count for `oracle-database` or `oci-service`.
+- If no policy is configured, or the policy does not grant a scope, the request is refused with `AuthorizationError`.
 
-For `token_type="oauth"` with `credential=None`, TokenFactory still performs construction-time OIDC discovery but does not run caller assertion validation. It resolves the selected hosting OAuth app from `client_key` and requests an application token directly from the discovered token endpoint with the OAuth client credentials grant.
+`userid` and requests without a caller token are never checked, because there is no scope or no user to check.
 
-### Token Request Authorization
-
-1. Authorization policy enforcement is opt-in. When `TF_SHARED_AUTHZ_POLICY_ENABLE=false` or unset, TokenFactory skips group-scope authorization checks for scoped flows.
-2. When `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, scoped assertion-backed flows such as `oauth` and `oracle-database` check the authorization policy to determine whether the requesting credential is entitled to request the scope.
-3. When enforcement is enabled, at least one caller group must be allowed to request every downstream scope. If no policy provider is configured or the policy does not grant the scope, TokenFactory fails closed.
-4. For `oauth`, authorization policy entries must match the requested scope exactly. If the request uses a fully qualified resource scope such as `https://orders-api.example.com/orders.read`, the policy must grant that fully qualified value.
-5. Unscoped flows such as `userid` and `oci-service` do not run group-scope authorization.
-6. OAuth client credentials mode does not run group-scope authorization because it has no caller assertion, end-user subject, or caller groups.
-
-### Token Request
-
-1. TokenFactory signs a new JWT assertion using the resolved hosting app issuer, private key, and `kid` when the selected flow needs assertion-backed token exchange.
-2. For assertion-backed `oauth`, TokenFactory first returns the incoming token unchanged when it is already valid for the requested OAuth resource audience and already carries the issued scope. Otherwise, it exchanges the assertion at the Identity Domain token endpoint and returns a downstream OAuth access token payload.
-3. For client credentials `oauth`, TokenFactory sends `grant_type=client_credentials` to the Identity Domain token endpoint with the requested scope and returns the OAuth access token payload. This path does not perform private-key signing or any other private-key cryptographic operation.
-4. For assertion-backed `oracle-database`, TokenFactory builds a UPST-backed signer, requests a scoped database token, and returns the database token plus session private key material. For `credential="OCI_PRINCIPAL"`, TokenFactory uses the configured OCI instance/resource principal signer directly.
-5. For `oci-service`, TokenFactory returns an OCI `TokenExchangeSigner` backed by the propagated user security token.
-6. For `userid`, TokenFactory returns the trusted subject identifier after credential validation.
-7. The client receives the token-type-specific result without implementing introspection, JWT signature validation, Vault secret loading, assertion signing, IdentityPropagationTrust, authorization, or OCI token exchange logic itself.
-
-## Required Runtime Configuration
-
-TokenFactory uses one configuration style for assertion-backed flows:
-
-- **Single-client process**: one running component owns one TokenFactory instance and one hosting OAuth app. Pass `oauth_apps` with one entry to `TokenFactory(oauth_apps=...)`, and pass that entry's key as `client_key` on every `get_token(...)` call.
-- **Multi-client process**: one running process hosts multiple OAuth app identities. Pass `oauth_apps` with one entry per hosting OAuth app, and pass `client_key` on every `get_token(...)` call to select the intended app.
-
-Shared runtime configuration covers process-wide settings such as Identity Domain URL, OCI auth mode, timeout, subject/group claim names, and authorization-policy verification. OAuth app configuration describes the hosting component's Identity Domain OAuth client credentials, JWT signing material, resource-server audiences, and required incoming scopes.
-
-Production environments should store OAuth app credentials, private keys, certificates, and signed authorization policy documents in OCI Vault. Direct values and local files are intended for development, tests, and controlled troubleshooting.
-
-When Vault-backed values are used, an IAM policy for the principal that runs the hosting application is required. The policy must allow reading every Vault secret OCID referenced by the selected OAuth app plus the authorization policy secret when one is configured.
-
-### Terraform Bootstrap Module
-
-Use [Token Factory Bootstrap Module](./bootstrap/) to provision required infrastructure for Token Factory runtime.
-
-The [Token Factory Bootstrap Client Module](./bootstrap/client/) exposes a concise output surface that application teams can plug into their runtime environments.
-
-The following Token Factory runtime requirements are automated by the bootstrap module. They are presented here for awareness.
-
-#### Identity Domain Pre-requisites
-
-**1. Confidential OAuth app client for each hosting app**
-
-Create one confidential app client in the same Identity Domain used by `TF_SHARED_DOMAIN_URL` for each hosting application that embeds TokenFactory.
-
-TokenFactory itself is not the OAuth client. The selected hosting app OAuth client is used for token introspection, JWT bearer exchange, and UPST-backed exchange. This material comes from the selected `oauth_apps[client_key]` entry or from an explicitly supplied resolver.
-
-Required grant types:
-
-- enable `Client Credentials`
-- enable `JWT Assertion`
-
-Operational notes:
-
-- The Vault secret value must be exactly `client_id:client_secret`.
-- For incoming caller assertion validation, configure the app as a resource server and issue caller tokens with an audience that appears in `OAuthClientInfo.resource_audiences`.
-- If `OAuthClientInfo.required_incoming_scopes` is set, the incoming caller assertion must already contain those scopes in `scope` or `scp`.
-- If `OAuthClientInfo.allowed_client_ids` is set, the incoming caller assertion must have been issued to one of those OAuth clients, or to the hosting app itself.
-- For UPST-backed flows (`oracle-database` with a caller assertion, and `oci-service`), the selected app client ID must also be listed in the `oauthClients` array of the `IdentityPropagationTrust`.
-- If the Identity Domain token endpoint starts returning `400 invalid_scope`, verify that the selected OAuth app owns the requested resource scope and that the caller application is allowed to request it. For resource scopes, the request often uses the fully qualified form such as `https://playground.mcp.server/tools.get_user_info`, while the issued access token may contain only `tools.get_user_info`.
-- If the Identity Domain token endpoint starts returning `400 invalid_request` after scope changes, verify the selected OAuth app grants, certificate alias, and JWT assertion configuration.
-
-**2. IdentityPropagationTrust for UPST (User Principal Service Token) Flows**
-
-`oracle-database` with a caller assertion and `oci-service` depend on an IdentityPropagationTrust because TokenFactory signs a JWT assertion for the selected hosting app and exchanges it into a UPST-backed signer. `oracle-database` with `credential="OCI_PRINCIPAL"` does not use this UPST path.
-
-The trust must be aligned with the module configuration:
-
-- `issuer` must equal the selected `OAuthClientInfo.issuer`
-- `publicCertificate` must represent the same certificate/private-key pair configured for the selected `OAuthClientInfo`
-- `oauthClients` must include the selected hosting app OAuth client ID
-- `subjectClaimName` should remain compatible with the module's JWT payload, which uses `sub`
-- if your trust requires a client claim, model that claim as part of the selected OAuth app/runtime configuration
-
-The common propagation-claim pattern is:
-
-```text
-TF_CLIENT_PROPAGATION_TRUST_CLAIM="upstclient:tokenexchange"
-```
-
-That maps cleanly to an IdentityPropagationTrust using:
-
-- `clientClaimName: "upstclient"`
-- `clientClaimValues: ["tokenexchange"]`
-
-Treat this claim as OAuth-app trust material rather than a shared TokenFactory default.
-
-Template request:
-
-```sh
-curl -X POST \
-  -H 'Authorization: Bearer <admin-access-token>' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "active": true,
-    "allowImpersonation": false,
-    "issuer": "https://upst.tokenfactory/",
-    "name": "Token Trust JWT to UPST",
-    "oauthClients": ["<hosting-oauth-client-id>"],
-    "publicCertificate": "<base64-encoded-leaf-certificate>",
-    "subjectClaimName": "sub",
-    "subjectMappingAttribute": "userName",
-    "subjectType": "User",
-    "type": "JWT",
-    "schemas": ["urn:ietf:params:scim:schemas:oracle:idcs:IdentityPropagationTrust"]
-  }' \
-  'https://<domain>.identity.oraclecloud.com:443/admin/v1/IdentityPropagationTrusts'
-```
-
-If your trust enforces a client claim, add:
-
-```json
-"clientClaimName": "upstclient",
-"clientClaimValues": ["tokenexchange"]
-```
-
-The Terraform bootstrap module can provision this trust for each `oauth_apps` entry when `enable_identity_propagation_trust = true`.
-
-**3. Identity Domain certificate store and `kid`**
-
-For `oauth`, TokenFactory sends a JWT bearer assertion to the Identity Domain token endpoint. The intended production setup is:
-
-- load the selected hosting app public key certificate into the Identity Domain certificate store
-- set the certificate alias to exactly match `OAuthClientInfo.kid`
-- configure the same certificate through the selected `OAuthClientInfo`
-- configure the matching private key through the selected `OAuthClientInfo`
-
-Why this matters:
-
-- `factory.py` adds `{"kid": <selected kid>}` to the JWT header when a `kid` is set
-- Identity Domain uses that alias to locate the certificate that validates the assertion signature
-- each `oauth_apps` entry used for assertion-backed exchange needs a certificate source, and the external Identity Domain validation still depends on the certificate matching the signing key
-
-If `kid` is omitted, TokenFactory sends an assertion without a `kid` header. An explicit `kid` is the clearer and more controlled setup.
-
-#### OCI Vault secret requirements
-
-The module can load OAuth app credentials, signing material, certificates, and authorization policy documents from OCI Vault.
-
-Expected secret contents when Vault-backed sources are used through `oauth_apps` secret OCID fields:
-
-- `client_credentials_secret_ocid`: plain text `client_id:client_secret`
-- `kms_key_id`: asymmetric OCI KMS key OCID
-- `kms_key_version_id`: exact key-version OCID matching the registered certificate
-- `kms_crypto_endpoint`: shared Vault cryptographic endpoint
-- `TF_SHARED_AUTHZ_POLICY_SECRET_OCID`: raw policy JSON or signed policy envelope JSON
-
-Notes:
-
-- Secret bundle content is base64-decoded and then treated as UTF-8 text, so PEM text is the safest format for key and certificate secrets.
-- If `TF_SHARED_OCI_REGION` is not set, the secret's region is derived from the OCID.
-- If any secret OCID source is configured, the runtime principal must be able to read every referenced secret. Use a dynamic group for instance-principal and resource-principal runtimes, or a user group for `TF_SHARED_OCI_AUTH_MODE=oci-profile`.
-- Example dynamic-group matching rules:
-
-  ```text
-  # Instance principal: all compute instances in one compartment.
-  instance.compartment.id = '<instance-compartment-ocid>'
-
-  # Instance principal: one compute instance.
-  instance.id = '<instance-ocid>'
-
-  # Resource principal: all OKE clusters in one compartment.
-  ALL {resource.type = 'cluster', resource.compartment.id = '<oke-cluster-compartment-ocid>'}
-
-  # Resource principal: one OKE cluster.
-  ALL {resource.id = '<oke-cluster-ocid>', resource.compartment.id = '<oke-cluster-compartment-ocid>'}
-  ```
-
-- Example policies granting Vault secret reads:
-
-  ```text
-  # Instance-principal authentication.
-  allow dynamic-group <instance-dynamic-group> to read secret-bundles in compartment <secrets-compartment-name>
-
-  # Resource-principal authentication, assuming the principal is an OKE cluster.
-  allow dynamic-group <oke-cluster-dynamic-group> to read secret-bundles in compartment <secrets-compartment-name>
-
-  # API-key authentication through TF_SHARED_OCI_AUTH_MODE=oci-profile.
-  allow group <user-group> to read secret-bundles in compartment <secrets-compartment-name>
-  ```
-
-  Add `where target.secret.id = '<secret-ocid>'` to restrict a policy to a specific configured secret.
-
-- Factory-owned OCI SDK clients use Instance Principals by default. `TF_SHARED_OCI_AUTH_MODE=resource-principal` uses Resource Principals directly, and `TF_SHARED_OCI_AUTH_MODE=oci-profile` enables local OCI API-key profile fallback.
-- Hosting assertion signing never loads private-key PEM. `OAuthClientInfo` carries only KMS key/version metadata and the public `kid`.
-
-
-### Shared runtime environment variables
-
-These variables populate `TokenFactoryRuntimeConfig` or process-level TokenFactory defaults and apply to the running TokenFactory process, regardless of which OAuth app is selected for a call.
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `TF_SHARED_DOMAIN_URL` | yes | Identity Domain base URL, for example `https://<domain>.identity.oraclecloud.com:443`. TokenFactory removes trailing slashes and reads `/.well-known/openid-configuration` beneath this URL once during construction. |
-| `TF_SHARED_DOMAIN_REGION` | yes | OCI region used for UPST `TokenExchangeSigner` and Identity Data Plane calls. |
-| `TF_SHARED_TIMEOUT_SECONDS` | optional | HTTP timeout in seconds; default `30`. |
-| `TF_SHARED_OCI_AUTH_MODE` | optional | OCI auth mode for factory-owned OCI SDK clients: `instance-principal` (default), `resource-principal`, or `oci-profile`. Required in practice when Vault OCIDs must be read. |
-| `TF_SHARED_OCI_AUTH_PROFILE` | optional | OCI CLI profile used when `TF_SHARED_OCI_AUTH_MODE=oci-profile`; defaults to `DEFAULT`. |
-| `TF_SHARED_OCI_REGION` | optional | Region override for OCI Vault secret reads. If unset, secret region is derived from the secret OCID when possible. |
-| `TF_SHARED_SUBJECT_CLAIM` | optional | Claim name used to extract the validated caller subject; defaults to `sub`. |
-| `TF_SHARED_GROUPS_CLAIM` | optional | Claim name used to extract caller groups for authorization; defaults to `groups`. |
-| `TF_SHARED_LOG_FULL_ASSERTION` | optional | Enables full compact JWT logging. Use only for controlled troubleshooting because assertions are replay-sensitive. |
-| `TF_SHARED_LOG_LEVEL` | optional | Module logger level; defaults to `INFO`. Accepted values are `CRITICAL`, `FATAL`, `ERROR`, `WARNING`, `WARN`, `INFO`, `DEBUG`, and `NOTSET`. |
-| `TF_SHARED_CACHE_ENABLE` | optional | Enables the instance-local TokenFactory result cache when set to `1`, `true`, `yes`, `y`, or `on`; defaults to `false`. Caller-bound cache hits still validate and authorize the incoming assertion before reusing downstream results. |
-| `TF_SHARED_CACHE_MAX_SIZE` | optional | Maximum number of cached TokenFactory results per instance; defaults to `1024`. When full, the cache evicts the least recently used entry. |
-
-### Authorization policy environment variables
-
-Authorization policy enforcement is disabled by default. When `TF_SHARED_AUTHZ_POLICY_ENABLE=false` or unset, TokenFactory does not run group-scope authorization checks for scoped token requests. When `TF_SHARED_AUTHZ_POLICY_ENABLE=true`, scoped assertion-backed flows (`oauth` and `oracle-database`) require a configured policy provider and are denied after caller assertion validation if no policy is configured or no grant matches.
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `TF_SHARED_AUTHZ_POLICY_ENABLE` | optional | Enables TokenFactory group-scope authorization when set to `1`, `true`, `yes`, `y`, or `on`; defaults to `false`. |
-| `TF_SHARED_AUTHZ_POLICY_SECRET_OCID` | required when enforcement uses the built-in Vault policy provider | OCI Vault secret OCID containing raw authorization policy JSON in `off` mode or a signed authorization policy envelope in `on` mode. This configures one policy-provider path; it is not the enforcement switch. |
-| `TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE` | optional | `off` or `on`; defaults to `off`. Production deployments with the security-owned matrix should use `on`. |
-| `TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON` | required when signature mode is `on` | JSON array of trusted signer entries with `key_id`, `key_version_id`, `algorithm`, and `public_key_pem`. |
-| `TF_SHARED_AUTHZ_POLICY_ENVIRONMENT` | optional | Expected signed-policy `metadata.environment`, such as `prod`. If set, mismatches fail closed. |
-| `TF_SHARED_AUTHZ_POLICY_TENANT_ID` | optional | Expected signed-policy `metadata.tenant_id`. Bootstrap emits this only when `emit_authz_policy_tenant_id = true`. |
-
-Trusted signer entry shape:
+The policy is a JSON document, usually stored in an OCI Vault secret referenced by `TF_SHARED_AUTHZ_POLICY_SECRET_OCID`:
 
 ```json
 {
-  "key_id": "ocid1.key.oc1...",
-  "key_version_id": "ocid1.keyversion.oc1...",
-  "algorithm": "SHA_256_RSA_PKCS_PSS",
-  "public_key_pem": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+  "version": 1,
+  "grants": {
+    "oauth": {
+      "all_users": ["https://inventory-api.example.com/inventory.read"]
+    },
+    "oracle-database": {
+      "analysts": ["urn:oracle:db::id::<compartment-ocid>::<database-ocid>"]
+    },
+    "oci-service": {
+      "cloud_ops": ["tools.get_oci_resources"]
+    }
+  }
 }
 ```
 
-### `oauth_apps` configuration
+Group names are the values of the groups claim in the caller token.
 
-Every `get_token(...)` call resolves the hosting OAuth app from the `oauth_apps` map passed to `TokenFactory(oauth_apps=...)`. The same structure is used for single-client and multi-client deployments. Assertion-backed flows use the entry's caller-validation and JWT-signing settings. OAuth client credentials mode uses the entry's `client_id:client_secret` to request an application token and does not perform private-key cryptographic operations.
+In production, the security team should own and sign the policy. With `TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE=on`, the secret holds a signed envelope, and Token Factory rejects it unless the signature verifies against one of the trusted signers in `TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON`. Verification happens locally; Token Factory does not call OCI KMS to verify. The protection depends on developers not being able to use the security team's KMS signing key or change the trusted signer list. Vault distributes the policy but is not what makes it trustworthy.
 
-| Field | Required | Purpose |
+## Configuration reference
+
+### Shared settings
+
+Shared settings apply to the whole process. Token Factory reads them from environment variables, or you can pass the same values as a `runtime_config` dict (or `TokenFactoryRuntimeConfig`) when creating the factory.
+
+| Environment variable | `runtime_config` key | Default | Purpose |
+| --- | --- | --- | --- |
+| `TF_SHARED_DOMAIN_URL` | `domain_url` | required | Identity Domain base URL, such as `https://<domain>.identity.oraclecloud.com:443`. |
+| `TF_SHARED_DOMAIN_REGION` | `domain_region` | required | Region of the Identity Domain, used for the OCI user session and database token calls. |
+| `TF_SHARED_TIMEOUT_SECONDS` | `timeout_seconds` | `30` | HTTP timeout. |
+| `TF_SHARED_OCI_AUTH_MODE` | `oci_auth_mode` | `instance-principal` | How Token Factory authenticates its own OCI calls (KMS signing, Vault reads, `OCI_PRINCIPAL`): `instance-principal`, `resource-principal`, `oke-workload-identity`, or `oci-profile`. |
+| `TF_SHARED_OCI_AUTH_PROFILE` | `oci_auth_profile` | `DEFAULT` | OCI CLI profile for `oci-profile` mode. |
+| `TF_SHARED_OCI_REGION` | `oci_region` | from the secret OCID | Region for Vault secret reads. |
+| `TF_SHARED_SUBJECT_CLAIM` | `subject_claim` | `sub` | Claim that holds the user ID. |
+| `TF_SHARED_GROUPS_CLAIM` | `groups_claim` | `groups` | Claim that holds the user's groups. Caller tokens without it are rejected. The bootstrap sets `group`. |
+| `TF_SHARED_AUTHZ_POLICY_ENABLE` | `authz_policy_enable` | `false` | Turns authorization on. |
+| `TF_SHARED_AUTHZ_POLICY_SECRET_OCID` | `authz_policy_secret_ocid` | none | Vault secret with the policy JSON, or the signed envelope when signature mode is `on`. |
+| `TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE` | `authz_policy_signature_mode` | `off` | `on` requires a signed policy. Use `on` in production. |
+| `TF_SHARED_AUTHZ_TRUSTED_SIGNERS_JSON` | `authz_trusted_signers` | none | Required when signature mode is `on`. JSON list of `{key_id, key_version_id, algorithm, public_key_pem}`, with `algorithm` set to `SHA_256_RSA_PKCS_PSS`. |
+| `TF_SHARED_AUTHZ_POLICY_ENVIRONMENT` | `authz_policy_environment` | none | If set, the signed policy's `metadata.environment` must match. |
+| `TF_SHARED_AUTHZ_POLICY_TENANT_ID` | `authz_policy_tenant_id` | none | If set, the signed policy's `metadata.tenant_id` must match. |
+| `TF_SHARED_CACHE_ENABLE` | `cache_enable` | `false` | Reuse unexpired results within one factory. Validation and authorization still run on every request. |
+| `TF_SHARED_CACHE_MAX_SIZE` | `cache_max_size` | `1024` | Cache size; the least recently used entry is evicted first. |
+| `TF_SHARED_LOG_LEVEL` | none | `INFO` | Level of the `token_factory` logger: `CRITICAL`, `ERROR`, `WARNING`, `INFO`, `DEBUG`, or `NOTSET` (`FATAL` and `WARN` are aliases). |
+| `TF_SHARED_LOG_FULL_ASSERTION` | `log_full_assertion` | `false` | Logs complete tokens. Troubleshooting only: logged tokens can be replayed. |
+
+Boolean settings accept `1`, `true`, `yes`, `y`, or `on`.
+
+### oauth_apps
+
+Each entry describes one hosting app. Values can be plain dicts or `OAuthClientInfo` objects.
+
+| Field | Needed for | Purpose |
 | --- | --- | --- |
-| `client_credentials` | yes, unless `client_credentials_secret_ocid` is set | Direct `client_id:client_secret`. |
-| `client_credentials_secret_ocid` | yes, unless `client_credentials` is set | Vault secret containing `client_id:client_secret`. |
-| `issuer` | yes for assertion-backed flows | JWT `iss` used when signing assertions for this hosting app. |
-| `kms_key_id` | yes for assertion-backed flows | Asymmetric OCI KMS signing-key OCID. |
-| `kms_key_version_id` | yes for assertion-backed flows | Exact key-version OCID bound to the registered public certificate. |
-| `kms_crypto_endpoint` | yes for assertion-backed flows | OCI Vault cryptographic endpoint used by KMS Sign. |
-| `kid` | strongly recommended | JWT `kid` header and Identity Domain certificate alias. |
-| `resource_audiences` | yes for real caller-token validation | Accepted incoming caller assertion audiences for this hosting app. |
-| `required_incoming_scopes` | optional | Required scopes that must already be present in the incoming caller assertion. Bootstrap derives this from Terraform `oauth_apps[*].resource_scopes`. |
-| `allowed_client_ids` | optional | Identity Domain client IDs allowed to call this hosting app, matched against the incoming token's `client_id`. `None` (default) disables the check. A list enables it; the hosting app's own client ID is always allowed, because an app can be both a client and a resource server, so `[]` means "only this app". Bootstrap emits it from `oauth_apps[*].allowed_clients` as `TF_CLIENT_ALLOWED_CLIENT_IDS` (comma-separated; an empty string means `[]`). |
+| `client_credentials` or `client_credentials_secret_ocid` | all requests | The app's `client_id:client_secret`, given directly or as a Vault secret that contains exactly that text. Use the Vault secret in production. |
+| `issuer` | requests with a caller token | Issuer of the assertions the app signs. It must match the app's IdentityPropagationTrust. |
+| `kid` | requests that sign assertions | Key ID placed in signed assertions. It must match the alias of the app's certificate in the Identity Domain. |
+| `kms_key_id`, `kms_key_version_id`, `kms_crypto_endpoint` | requests that sign assertions | The OCI KMS key, exact key version, and Vault cryptographic endpoint used to sign. The private key never leaves KMS. |
+| `resource_audiences` | requests with a caller token | Audiences the caller token may have. An empty list skips the audience check, so use it only in tests. |
+| `required_incoming_scopes` | optional | Scopes the caller token may carry; at least one is required. Empty skips the check. |
+| `allowed_client_ids` | optional | OAuth client IDs allowed to send caller tokens. Unset (`None`) skips the check. The app's own client ID is always allowed, so `[]` means only the app itself. |
+| `propagation_trust_claim` | `oracle-database` and `oci-service` with a caller token, when the trust requires it | Extra claim for the IdentityPropagationTrust, written as `name:value`, such as `upstclient:tokenexchange`. |
 
-Important behavior details:
+"Requests that sign assertions" are `oauth` exchanges with a caller token, `oracle-database` with a caller token, and `oci-service`. `oauth` without a caller token needs only the client credentials.
 
-- `get_token()` validates incoming caller assertions before trusting subject, groups, audience, or incoming scopes. OAuth client credentials mode is the explicit exception because it has no incoming caller assertion.
-- `get_token()` authorizes scoped assertion-backed downstream flows only when `TF_SHARED_AUTHZ_POLICY_ENABLE=true`. OAuth client credentials mode is scoped but application-only, so it does not run caller group-scope authorization.
-- For `oauth`, `scope` is the Identity Domain token request scope. Use the fully qualified resource scope when the Identity Domain requires it, for example `https://playground.mcp.server/tools.get_user_info`. For assertion-backed OAuth, TokenFactory authorizes the exact requested scope, so policy documents must grant that fully qualified value.
-- For assertion-backed `oauth`, TokenFactory can pass through the incoming token instead of minting a new one only when the validated incoming token already has the requested resource audience and the issued scope.
-- For client credentials `oauth`, TokenFactory always requests a new application token from the Identity Domain token endpoint with `grant_type=client_credentials`.
-- `userid` validates the incoming assertion and extracts the configured subject claim, but does not run group/scope authorization.
-- `oci-service` validates the incoming assertion and returns an OCI `TokenExchangeSigner`; it does not run group/scope authorization because it has no requested downstream scope.
-- `get_token_with_oci_credential()` is a separate OAuth token-exchange API for OCI signer dictionaries or OCI CLI profile names. Current code does not validate an end-user assertion and does not run group/scope authorization for that API.
-- `TF_SHARED_CACHE_ENABLE=true` lets a TokenFactory instance reuse unexpired downstream OAuth, Oracle Database, OCI service signer, and OCI-credential OAuth results. Cache keys use request dimensions and credential fingerprints, opaque responses without a reliable expiration are not cached, and `TF_SHARED_CACHE_MAX_SIZE` bounds memory by evicting least recently used entries.
-- Vault-backed OAuth app values require the hosting runtime principal to read the referenced secrets.
-- Direct client credentials avoid a Vault Secret read, but assertion signing still requires OCI KMS.
-- `TF_SHARED_OCI_AUTH_MODE` and `TF_SHARED_OCI_AUTH_PROFILE` apply to factory-owned OCI clients generally, including Vault secret reads.
+### Mapping bootstrap outputs to oauth_apps
 
-Identity Domain discovery and hybrid validation notes:
+The bootstrap outputs one `TF_CLIENT_*` set per hosting app. Your application turns each set into an `oauth_apps` entry:
 
-- TokenFactory always validates caller assertions with hybrid validation: Identity Domain introspection must return `active=true`, and the same incoming JWT must validate against the Identity Domain signing keys.
-- TokenFactory discovers `issuer`, `jwks_uri`, `token_endpoint`, and `introspection_endpoint` once during construction from `<domain_url>/.well-known/openid-configuration`. The immutable snapshot is reused for the factory lifetime; construct a new factory to refresh it.
-- Construction fails closed when discovery is unreachable, unsuccessful, malformed, incomplete, or contains a required URL that is not a safe absolute HTTPS URL.
-- `TF_SHARED_DOMAIN_REGION` remains explicit because standard OIDC metadata does not publish the Identity Domain home region. `TF_SHARED_OCI_REGION` remains the separate OCI workload/resource region.
-- `TF_CLIENT_ISSUER` remains explicit: it is the hosting application's assertion issuer and is not the Identity Domain issuer returned by discovery.
-- Clients do not configure token, introspection, JWKS, or Identity Domain validation-issuer overrides.
-- TokenFactory copies the configured `groups_claim` from the validated JWT into the trusted claims so authorization can use custom signed claims that introspection omits.
-- For a custom authorization claim such as `group`, set `TokenFactoryRuntimeConfig(groups_claim="group")` and keep authorization policy groups keyed by claim values such as `all_users`.
-- Runtime network access to the Identity Domain discovery document, discovered token and introspection endpoints, and JWKS endpoint is required.
+| Bootstrap output | `oauth_apps` | Notes |
+| --- | --- | --- |
+| `TF_CLIENT_KEY` | the entry's key | Pass it as `client_key`. |
+| `TF_CLIENT_CREDS_SECRET_OCID` | `client_credentials_secret_ocid` | |
+| `TF_CLIENT_ISSUER` | `issuer` | |
+| `TF_CLIENT_KID` | `kid` | |
+| `TF_CLIENT_KMS_KEY_ID` | `kms_key_id` | |
+| `TF_CLIENT_KMS_KEY_VERSION_ID` | `kms_key_version_id` | |
+| `TF_CLIENT_KMS_CRYPTO_ENDPOINT` | `kms_crypto_endpoint` | |
+| `TF_CLIENT_RESOURCE_AUDIENCES` | `resource_audiences` | Comma-separated list. |
+| `TF_CLIENT_REQUIRED_INCOMING_SCOPES` | `required_incoming_scopes` | Comma-separated list. |
+| `TF_CLIENT_ALLOWED_CLIENT_IDS` | `allowed_client_ids` | Comma-separated list. Absent means `None` (check off); an empty string means `[]` (only the app itself). |
+| `TF_CLIENT_PROPAGATION_TRUST_CLAIM` | `propagation_trust_claim` | |
 
-Signed authorization policy notes:
+For more control, such as loading app settings from your own store, pass an `oauth_client_resolver` instead of `oauth_apps`. See [advanced scenarios](./docs/advanced-scenarios.md).
 
-- The security team owns the production groups/scope matrix. OCI Vault stores and distributes it, but Vault is not the root of trust.
-- Primary control: developers must not have `manage keys` or `use keys` on the security-owned OCI KMS asymmetric signing key, and must not be able to alter the trusted signer bundle.
-- Defense-in-depth: TokenFactory rejects the policy secret unless the signed envelope verifies against the trusted `key_id`, `key_version_id`, `algorithm`, and `public_key_pem`.
-- `key_id` and `key_version_id` are OCI OCIDs used to match envelope metadata to a trusted signer entry. `public_key_pem` is the public key used for the offline signature verification, and it must correspond to that trusted OCI key version.
-- The trusted signer bundle may be delivered through environment variables only when platform or security deployment ownership prevents non-security actors from changing those variables.
-- TokenFactory verifies signatures offline and does not call OCI KMS `Verify` at runtime.
+## Identity Domain and OCI setup
 
-Logging notes:
+The [bootstrap module](./bootstrap/) sets all of this up. This section explains what it creates and why, for review or manual setup.
 
-- `TF_SHARED_LOG_LEVEL=DEBUG` enables the module's debug records, including `_factory_support.py` method-entry logs emitted through `LOGGER.debug(...)`.
-- `FATAL` is accepted as an alias for `CRITICAL`; `WARN` is accepted as an alias for `WARNING`.
-- `NOTSET` is a valid Python logging level, but it makes the `token_factory` logger inherit the effective level from parent/root logging configuration. Use `DEBUG` when you explicitly need debug output.
-- The module sets the `token_factory` logger level directly so `TF_SHARED_LOG_LEVEL` still takes effect when another framework has already configured root logging. Existing handler-level filters, OCI Function/runtime log filters, or external log collectors can still suppress records after the logger emits them.
+**OAuth app per hosting app.** A confidential app in the Identity Domain named by `TF_SHARED_DOMAIN_URL`, with the Client Credentials and JWT Assertion grants enabled. Token Factory uses it to ask the Identity Domain about caller tokens and to exchange tokens. To receive caller tokens, the app must be a resource server whose audience appears in `resource_audiences`.
 
+**Signing key and certificate.** Each hosting app signs assertions with an asymmetric OCI KMS key. A certificate for that key version is registered in the Identity Domain under the alias `kid`, so the Identity Domain can verify what the app signs. When you rotate the key version, publish a new certificate with a new `kid`.
 
-## Runtime Example
+**IdentityPropagationTrust.** Needed for `oracle-database` with a caller token and for `oci-service`. It lets the Identity Domain exchange a user assertion signed by the hosting app for an OCI user session. It must:
 
-1. Set the following process variables for the hosting application. These values are provided by the bootstrap module.
-```sh
-export TF_SHARED_DOMAIN_URL="https://<domain>.identity.oraclecloud.com:443"
-export TF_SHARED_DOMAIN_REGION="us-chicago-1"
-export TF_SHARED_AUTHZ_POLICY_ENABLE="true"
-export TF_SHARED_AUTHZ_POLICY_SECRET_OCID="ocid1.vaultsecret.oc1..<authz-policy>"
-export TF_SHARED_AUTHZ_POLICY_SIGNATURE_MODE="off"
-export TF_SHARED_TIMEOUT_SECONDS="30"
-```
+- have `issuer` equal to the app's `issuer`;
+- hold the certificate of the app's KMS signing key version as `publicCertificate`;
+- list the app's client ID in `oauthClients`;
+- map the assertion's `sub` to users (`subjectClaimName: "sub"`, `subjectMappingAttribute: "userName"`);
+- if it requires a client claim (`clientClaimName` and `clientClaimValues`), match the app's `propagation_trust_claim`.
 
-2. Let Token Factory know about the hosting application. These values are provided by the bootstrap module.
-```python
-from token_factory import TokenFactory
+**OCI IAM for the runtime.** The identity that runs the hosting app needs:
 
-factory = TokenFactory(
-    oauth_apps={
-        "orders-api": {
-            "client_credentials_secret_ocid": "ocid1.vaultsecret.oc1..<orders-client-credentials>",
-            "issuer": "https://orders-api.example.com/token-factory",
-            "kms_key_id": "ocid1.key.oc1..<orders-signing-key>",
-            "kms_key_version_id": "ocid1.keyversion.oc1..<orders-signing-key-version>",
-            "kms_crypto_endpoint": "https://<vault>-crypto.kms.us-chicago-1.oraclecloud.com",
-            "kid": "orders-api-token-factory-cert",
-            "resource_audiences": ["orders-api"],
-            "required_incoming_scopes": ["orders-api.invoke"],
-        }
-    }
-)
-```
-If you do not use process-wide environment variables in step 1 above, pass the same runtime values into TokenFactory under the *runtime_config* map:
+- `use keys` on its KMS signing key, to sign assertions;
+- `read secret-bundles` on its Vault secrets: the client credentials and, if used, the authorization policy;
+- for `oracle-database` with `OCI_PRINCIPAL`, the database access its own identity requires.
 
-```python
-from token_factory import TokenFactory
+The bootstrap restricts these policies to the exact runtime (instance, function, or OKE namespace and service account) and the exact key and secrets.
 
-factory = TokenFactory(
-    runtime_config={
-        "domain_url": "https://<domain>.identity.oraclecloud.com:443",
-        "domain_region": "us-chicago-1",
-        "timeout_seconds": 30,
-        "oci_auth_mode": "instance-principal",
-        "oci_region": "us-chicago-1",
-        "subject_claim": "sub",
-        "groups_claim": "groups",
-        "authz_policy_enable": True,
-        "authz_policy_secret_ocid": "ocid1.vaultsecret.oc1..<authz-policy-secret>",
-        "authz_policy_signature_mode": "off",
-    },
-    oauth_apps={
-        "orders-api": {
-            "client_credentials_secret_ocid": "ocid1.vaultsecret.oc1..<orders-client-credentials>",
-            "issuer": "https://orders-api.example.com/token-factory",
-            "kms_key_id": "ocid1.key.oc1..<orders-signing-key>",
-            "kms_key_version_id": "ocid1.keyversion.oc1..<orders-signing-key-version>",
-            "kms_crypto_endpoint": "https://<vault>-crypto.kms.us-chicago-1.oraclecloud.com",
-            "kid": "orders-api-token-factory-cert",
-            "resource_audiences": ["orders-api"],
-            "required_incoming_scopes": ["orders-api.invoke"],
-        }
-    },
-)
-```
+## Troubleshooting
 
-3. Request token, specifying the token type, the required scope and the client_key (for the hosting component).
-```python
-result = factory.get_token(
-    "<incoming-caller-access-token>",
-    token_type="oauth",
-    scope="urn:opc:idm:orders.read",
-    client_key="orders-api",
-)
+- **Every caller token is rejected with a missing claim.** The token lacks the groups claim. Set `TF_SHARED_GROUPS_CLAIM` to the claim your Identity Domain uses (the bootstrap uses `group`). Tokens issued to an application with no user usually carry no groups and are rejected.
+- **`is not an allowed client of the selected hosting component`.** The caller's OAuth client is not in `allowed_client_ids`. Add its client ID, or, with the bootstrap, add its `oauth_apps` key to `allowed_clients`.
+- **`400 invalid_scope` from the Identity Domain.** The requested scope does not exist, or the requesting app is not allowed to request it. Requests often need the fully qualified form, such as `https://playground.mcp.server/tools.get_user_info`, while the issued token contains only `tools.get_user_info`.
+- **`400 invalid_request` after configuration changes.** Check the app's grants, the certificate alias (`kid`), and that the certificate matches the KMS key version in use.
+- **Factory creation fails.** Token Factory could not read the Identity Domain's discovery document at `<TF_SHARED_DOMAIN_URL>/.well-known/openid-configuration`. The runtime needs network access to it and to the endpoints it lists.
+- **Need more detail.** Set `TF_SHARED_LOG_LEVEL=DEBUG`. If your framework configures logging, its handlers can still filter these records.
 
-oauth_access_token = result["token"]
-```
+## Related docs
 
-## Related Docs
-
-- [docs/advanced-scenarios.md](./docs/advanced-scenarios.md)
-- [docs/oci-compute-usage.md](./docs/oci-compute-usage.md)
-- [samples/oci_compute_usage.py](./samples/oci_compute_usage.py)
-- [Token Factory Bootstrap Module](./bootstrap/)
+- [Advanced scenarios](./docs/advanced-scenarios.md)
+- [Using Token Factory on OCI Compute](./docs/oci-compute-usage.md)
+- [Sample command-line client](./samples/oci_compute_usage.py)
+- [Bootstrap module](./bootstrap/)

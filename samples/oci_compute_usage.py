@@ -75,7 +75,7 @@ def parse_args(argv: Optional[list[str]] = None):
     add_token_command(
         subparsers,
         "oci-service",
-        "Validate the caller and build an OCI TokenExchangeSigner.",
+        "Validate the caller, authorize --scope when TF_SHARED_AUTHZ_POLICY_ENABLE=true, and build an OCI TokenExchangeSigner.",
         scope_required=False,
     )
 

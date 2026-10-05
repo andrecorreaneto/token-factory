@@ -556,6 +556,50 @@ class TokenFactorySimplificationTests(unittest.TestCase):
 
         self.assertEqual(result["access_token"], "issued-token")
 
+    def _oci_service_factory(self, *, authz_policy_enable, grants=None, groups=("ops",), **kwargs):
+        policy = AuthorizationPolicy(version=1, grants=grants or {"oci-service": {"ops": ["tools.get_oci_resources"]}})
+        validator = FakeTokenValidator(claims={"sub": "user@example.com", "groups": list(groups)})
+        factory = TokenFactory(runtime_config=runtime_config(authz_policy_enable=authz_policy_enable, **kwargs), oauth_apps=oauth_apps(), authorization_policy_provider=StaticAuthorizationPolicyProvider(policy), token_validator=validator)
+        return factory, validator
+
+    def test_oci_service_without_authorization_needs_no_scope(self):
+        factory, _validator = self._oci_service_factory(authz_policy_enable=False, groups=["users"])
+
+        self.assertIsInstance(factory.get_token("caller.jwt", "oci-service", client_key="orders"), _FakeTokenExchangeSigner)
+
+    def test_oci_service_authorization_allows_granted_group(self):
+        factory, _validator = self._oci_service_factory(authz_policy_enable=True)
+
+        self.assertIsInstance(factory.get_token("caller.jwt", "oci-service", "tools.get_oci_resources", client_key="orders"), _FakeTokenExchangeSigner)
+
+    def test_oci_service_authorization_denies_ungranted_group(self):
+        factory, _validator = self._oci_service_factory(authz_policy_enable=True, groups=["users"])
+
+        with self.assertRaisesRegex(AuthorizationError, "tools.get_oci_resources"):
+            factory.get_token("caller.jwt", "oci-service", "tools.get_oci_resources", client_key="orders")
+
+    def test_oci_service_authorization_requires_scope_before_validating_the_token(self):
+        factory, validator = self._oci_service_factory(authz_policy_enable=True)
+
+        for scope in (None, "", "  "):
+            with self.subTest(scope=scope), self.assertRaisesRegex(ValueError, "Scope is required for token_type 'oci-service' when TF_SHARED_AUTHZ_POLICY_ENABLE=true"):
+                factory.get_token("caller.jwt", "oci-service", scope, client_key="orders")
+        self.assertEqual(validator.calls, [])
+
+    def test_oci_service_authorization_ignores_grants_for_other_token_types(self):
+        factory, _validator = self._oci_service_factory(authz_policy_enable=True, grants={"oauth": {"ops": ["tools.get_oci_resources"]}})
+
+        with self.assertRaises(AuthorizationError):
+            factory.get_token("caller.jwt", "oci-service", "tools.get_oci_resources", client_key="orders")
+
+    def test_oci_service_cache_hit_is_still_authorized(self):
+        policy = AuthorizationPolicy(version=1, grants={"oci-service": {"ops": ["tools.get_oci_resources"]}})
+        factory = TokenFactory(runtime_config=runtime_config(authz_policy_enable=True, cache_enable=True), oauth_apps=oauth_apps(), authorization_policy_provider=StaticAuthorizationPolicyProvider(policy), token_validator=FakeTokenValidator(claims={"sub": "user@example.com", "groups": ["ops"]}))
+        factory.get_token("caller.jwt", "oci-service", "tools.get_oci_resources", client_key="orders")
+
+        with self.assertRaises(AuthorizationError):
+            factory.get_token("caller.jwt", "oci-service", "tools.delete_everything", client_key="orders")
+
     def test_process_selector_is_reserved(self):
         factory = TokenFactory(runtime_config=runtime_config(), oauth_apps=oauth_apps())
 
