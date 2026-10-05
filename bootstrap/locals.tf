@@ -241,6 +241,12 @@ locals {
     key => "${local.identity_domain_apps[key].name}:${local.identity_domain_apps[key].client_secret}"
   }
 
+  # null disables the runtime client check; a list (even empty) enables it, and each app always accepts its own client ID.
+  allowed_client_ids = {
+    for key, component in var.oauth_apps :
+    key => component.allowed_clients == null ? null : [for caller in component.allowed_clients : local.identity_domain_apps[caller].name]
+  }
+
   client_credentials_secret_ocids = {
     for key, component in var.oauth_apps :
     key => var.enable_oci_secrets ? oci_vault_secret.client_credentials[key].id : null
@@ -432,6 +438,7 @@ locals {
         kms_crypto_endpoint            = local.vault_crypto_endpoint
         resource_audiences             = component.resource_audiences
         required_incoming_scopes       = component.resource_scopes
+        allowed_client_ids             = local.allowed_client_ids[key]
         propagation_trust_claim        = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
       } : config_key => config_value if config_value != null
     }
@@ -463,6 +470,7 @@ locals {
         TF_CLIENT_RESOURCE_AUDIENCES       = join(",", component.resource_audiences)
         TF_CLIENT_REQUIRED_INCOMING_SCOPES = length(component.resource_scopes) == 0 ? null : join(",", component.resource_scopes)
         TF_CLIENT_PROPAGATION_TRUST_CLAIM  = component.propagation_trust_claim_name == null ? null : "${component.propagation_trust_claim_name}:${component.propagation_trust_claim_value}"
+        TF_CLIENT_ALLOWED_CLIENT_IDS       = local.allowed_client_ids[key] == null ? null : join(",", local.allowed_client_ids[key])
       } : config_key => config_value if config_value != null
     }
   }

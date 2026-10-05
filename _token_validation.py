@@ -141,6 +141,18 @@ def _validated_from_claims(claims: Dict[str, Any], hosting_component: ResolvedHo
             "Accepted scope(s): " + ", ".join(sorted(required_incoming_scopes))
         )
 
+    allowed_client_ids = hosting_component.allowed_client_ids
+    if allowed_client_ids is not None:
+        incoming_client_id = str(claims.get("client_id") or "").strip()
+        if not incoming_client_id:
+            raise CallerAssertionValidationError(
+                "Incoming caller assertion is missing client_id, and the selected hosting component restricts its allowed clients."
+            )
+        if incoming_client_id != hosting_component.oauth_identity.client_id and incoming_client_id not in allowed_client_ids:
+            raise CallerAssertionValidationError(
+                f"Incoming caller assertion client '{incoming_client_id}' is not an allowed client of the selected hosting component."
+            )
+
     return ValidatedCallerAssertion(
         issuer=claims.get("iss"),
         audience=audience,

@@ -160,6 +160,7 @@ variable "oauth_apps" {
     resource_scopes      = optional(list(string), [])
     allowed_scopes       = optional(list(string), [])
     app_roles            = optional(list(string), [])
+    allowed_clients      = optional(list(string), null)
 
     compute_runtime = optional(object({
       instance_ocid = string

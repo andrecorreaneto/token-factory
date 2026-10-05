@@ -95,6 +95,35 @@ class BootstrapKmsSigningContractTests(unittest.TestCase):
         self.assertIn("identity_domain_apps = merge(oci_identity_domains_app.these, oci_identity_domains_app.scope_consumers)", locals_text)
 
 
+class BootstrapAllowedClientContractTests(unittest.TestCase):
+    def test_allowed_clients_are_oauth_app_keys_resolved_to_client_ids(self):
+        variables = (ROOT / "bootstrap" / "variables.tf").read_text(encoding="utf-8")
+        locals_text = (ROOT / "bootstrap" / "locals.tf").read_text(encoding="utf-8")
+
+        self.assertIn("allowed_clients      = optional(list(string), null)", variables)
+        self.assertIn("contains(keys(var.oauth_apps), caller)", variables)
+        self.assertIn("[for caller in component.allowed_clients : local.identity_domain_apps[caller].name]", locals_text)
+
+    def test_allowed_client_ids_reach_runtime_config_and_exports(self):
+        locals_text = (ROOT / "bootstrap" / "locals.tf").read_text(encoding="utf-8")
+        client_outputs = (ROOT / "bootstrap" / "client" / "outputs.tf").read_text(encoding="utf-8")
+        resolution = (ROOT / "_oauth_client_resolution.py").read_text(encoding="utf-8")
+
+        self.assertIn("allowed_client_ids             = local.allowed_client_ids[key]", locals_text)
+        self.assertIn('lookup(config.oauth_client_config, "allowed_client_ids", null)', client_outputs)
+        self.assertIn("TF_CLIENT_ALLOWED_CLIENT_IDS", client_outputs)
+        self.assertIn("allowed_client_ids: Optional[List[str]] = None", resolution)
+
+    def test_allowed_client_ids_feed_outputs_only_so_apps_cannot_form_a_cycle(self):
+        # The allow-list reads every app's client ID; any resource reading it back would create a cycle.
+        for path in (ROOT / "bootstrap").glob("*.tf"):
+            if path.name in ("locals.tf", "outputs.tf", "variables.tf"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for name in ("allowed_client", "oauth_app_configs", "token_factory_client_configs"):
+                self.assertNotIn(name, text, f"{path.name} must not read {name}")
+
+
 class BootstrapRuntimeShapeTests(unittest.TestCase):
     def test_identity_domain_runtime_inputs_remain_base_url_and_regions(self):
         variables = (ROOT / "bootstrap" / "variables.tf").read_text(encoding="utf-8")

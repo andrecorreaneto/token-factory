@@ -134,6 +134,7 @@ from token_factory import (  # noqa: E402
     ConfigurationError,
     OAuthClientInfo,
     StaticAuthorizationPolicyProvider,
+    StaticOAuthClientResolver,
     TokenExchangeError,
     TokenFactory,
     TokenFactoryRuntimeConfig,
@@ -871,6 +872,25 @@ class HttpServiceTests(unittest.TestCase):
                 self.assertEqual(status, expected_status)
                 self.assertEqual(body["message"], str(error))
 
+
+
+class AllowedClientResolutionTests(unittest.TestCase):
+    def _resolve(self, **overrides):
+        return StaticOAuthClientResolver(oauth_apps(**overrides)).resolve("orders")
+
+    def test_client_check_is_off_by_default(self):
+        self.assertIsNone(self._resolve().allowed_client_ids)
+
+    def test_allowed_client_ids_are_normalized(self):
+        self.assertEqual(self._resolve(allowed_client_ids=[" agent-id ", "", "agent-id", "batch-id"]).allowed_client_ids, ["agent-id", "batch-id"])
+
+    def test_empty_allow_list_is_kept_distinct_from_no_check(self):
+        self.assertEqual(self._resolve(allowed_client_ids=[]).allowed_client_ids, [])
+
+    def test_oauth_apps_dict_accepts_allowed_client_ids(self):
+        factory = TokenFactory(runtime_config=runtime_config(), oauth_apps={"orders": {"client_credentials": "client-id:client-secret", "allowed_client_ids": ["agent-id"]}}, token_validation_session=RecordingDiscoverySession())
+
+        self.assertEqual(factory._resolve_hosting_component("orders", require_signing_material=False).allowed_client_ids, ["agent-id"])
 
 if __name__ == "__main__":
     unittest.main()
