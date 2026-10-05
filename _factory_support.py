@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple
@@ -8,6 +9,7 @@ from cryptography.hazmat.primitives import serialization
 from oci.auth.signers import (
     InstancePrincipalsSecurityTokenSigner,
     TokenExchangeSigner,
+    get_oke_workload_identity_resource_principal_signer,
     get_resource_principals_signer,
 )
 from oci.config import from_file as load_oci_config
@@ -53,6 +55,64 @@ class TokenExchangeError(RuntimeError):
     """Raised when upstream token exchange or database token issuance fails."""
 
 
+class DiscoveredTokenExchangeSigner(TokenExchangeSigner):
+    """OCI security-token signer that exchanges assertions at one discovered endpoint."""
+
+    def __init__(self, jwt_or_func: Any, token_endpoint: str, client_id: str, client_secret: str, region: Optional[str] = None, **kwargs: Any):
+        self.token_endpoint = token_endpoint
+        super().__init__(jwt_or_func, token_endpoint, client_id, client_secret, region=region, **kwargs)
+
+    def _get_new_token(self) -> str:
+        jwt_assertion = self._get_jwt()
+        public_key_pem = self.session_key_supplier.private_key.public_key().public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo).decode("utf-8")
+        public_key_value = public_key_pem.replace("\n", "").replace("-----BEGIN PUBLIC KEY-----", "").replace("-----END PUBLIC KEY-----", "")
+        encoded_auth = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode("utf-8")).decode("utf-8")
+        response = self.requests_session.post(
+            self.token_endpoint,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Authorization": f"Basic {encoded_auth}"},
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "requested_token_type": "urn:oci:token-type:oci-upst",
+                "subject_token": jwt_assertion,
+                "subject_token_type": "jwt",
+                "public_key": public_key_value,
+            },
+            allow_redirects=False,
+        )
+        status_code = getattr(response, "status_code", None)
+        if not isinstance(status_code, int) or status_code < 200 or status_code >= 300:
+            raise TokenExchangeError(f"Identity propagation token exchange failed with status {status_code if status_code is not None else 'unknown'}.")
+        payload = response.json()
+        token = payload.get("token") if isinstance(payload, dict) else None
+        if not token:
+            raise TokenExchangeError("Identity propagation token exchange response missing token.")
+        return str(token)
+
+
+class KmsJwtSigner:
+    """Signs compact-JWS inputs through an OCI KMS asymmetric key."""
+
+    def __init__(self, key_id: str, key_version_id: str, crypto_endpoint: str, factory_signer_builder: Any, runtime_config: Any):
+        self._key_id = key_id
+        self._key_version_id = key_version_id
+        self._crypto_endpoint = crypto_endpoint
+        self._factory_signer_builder = factory_signer_builder
+        self._runtime_config = runtime_config
+
+    def sign(self, signing_input: bytes) -> bytes:
+        from oci.key_management import KmsCryptoClient
+        from oci.key_management.models import SignDataDetails
+
+        client = KmsCryptoClient(config={"region": self._runtime_config.oci_region}, service_endpoint=self._crypto_endpoint, signer=self._factory_signer_builder(self._runtime_config))
+        digest = hashlib.sha256(signing_input).digest()
+        details = SignDataDetails(message=base64.b64encode(digest).decode("ascii"), message_type="DIGEST", key_id=self._key_id, key_version_id=self._key_version_id, signing_algorithm="SHA_256_RSA_PKCS1_V1_5")
+        response = client.sign(details)
+        try:
+            return base64.b64decode(response.data.signature)
+        except Exception as exc:
+            raise TokenExchangeError(f"OCI KMS returned an invalid JWT signature: {exc}") from exc
+
+
 SUPPORTED_TOKEN_TYPES = (
     "oracle-database",
     "oci-service",
@@ -61,8 +121,8 @@ SUPPORTED_TOKEN_TYPES = (
 )
 TOKEN_TYPES_REQUIRING_SCOPE = ("oracle-database", "oauth")
 OCI_IDENTITY_AUDIENCE = "https://identity.oraclecloud.com/"
-_ALLOWED_OCI_AUTH_MODES = {"instance-principal", "oci-profile", "resource-principal"}
-_OCI_AUTH_MODE_ERROR = "TF_SHARED_OCI_AUTH_MODE must be one of: instance-principal, oci-profile, resource-principal"
+_ALLOWED_OCI_AUTH_MODES = {"instance-principal", "oci-profile", "resource-principal", "oke-workload-identity"}
+_OCI_AUTH_MODE_ERROR = "TF_SHARED_OCI_AUTH_MODE must be one of: instance-principal, oci-profile, resource-principal, oke-workload-identity"
 
 
 def _redact_ocid(value: Optional[str]) -> str:
@@ -212,6 +272,12 @@ def _get_factory_oci_signer(config: Any):
             return get_resource_principals_signer()
         except Exception as exc:
             raise ConfigurationError(f"Failed to initialize factory OCI signer with resource principal: {exc}.") from exc
+    if oci_auth_mode == "oke-workload-identity":
+        try:
+            LOGGER.info("Attempting factory OCI signer initialization with OKE workload identity.")
+            return get_oke_workload_identity_resource_principal_signer()
+        except Exception as exc:
+            raise ConfigurationError(f"Failed to initialize factory OCI signer with OKE workload identity: {exc}.") from exc
 
     try:
         LOGGER.info("Attempting factory OCI signer initialization with instance principals.")

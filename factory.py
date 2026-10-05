@@ -13,11 +13,8 @@ from urllib.parse import urlencode, urlsplit
 
 import jwt
 import requests
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from oci.auth.signers import TokenExchangeSigner
-
 from ._authorization import (
     AuthorizationPolicyProvider,
     AuthorizationRequest,
@@ -27,13 +24,15 @@ from ._authorization import (
     VaultJsonAuthorizationPolicyProvider,
 )
 from ._errors import CallerAssertionValidationError, OAuthClientResolutionError
+from ._identity_domain_discovery import IdentityDomainMetadata, discover_identity_domain_metadata
 from ._factory_support import (
     ConfigurationError,
+    DiscoveredTokenExchangeSigner,
+    KmsJwtSigner,
     LOGGER,
     OCI_IDENTITY_AUDIENCE,
     SUPPORTED_TOKEN_TYPES,
     TokenExchangeError,
-    _extract_identity_domain_id,
     _extract_token_exchange_signer_keypair_pem,
     _fetch_secret_value_from_oci,
     _generate_db_token_with_dataplane,
@@ -143,7 +142,7 @@ class TokenResultCache:
 class TokenFactory:
     """Exchanges caller or OCI credentials for documented downstream token shapes."""
 
-    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = TokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer, token_cache_enabled: Optional[bool] = None, token_cache: Optional[TokenResultCache] = None, token_cache_skew_seconds: int = 5, token_cache_max_size: Optional[int] = None):
+    def __init__(self, config_overrides: Optional[Dict[str, Any]] = None, *, runtime_config: Optional[Union[TokenFactoryRuntimeConfig, Dict[str, Any]]] = None, oauth_apps: Optional[Dict[str, Union[Dict[str, Any], OAuthClientInfo]]] = None, oauth_client_resolver: Optional[OAuthClientResolver] = None, authorization_policy_provider: Optional[AuthorizationPolicyProvider] = None, authorizer: Optional[GroupScopeAuthorizer] = None, token_endpoint_session: Any = requests, token_validation_session: Any = requests, token_validator: Any = None, token_exchange_signer_cls: Any = DiscoveredTokenExchangeSigner, signer_keypair_extractor: Any = _extract_token_exchange_signer_keypair_pem, db_token_generator: Any = _generate_db_token_with_dataplane, factory_oci_signer_builder: Any = _get_factory_oci_signer, oci_signer_builder: Any = build_oci_request_signer, jwt_assertion_signer: Any = None, token_cache_enabled: Optional[bool] = None, token_cache: Optional[TokenResultCache] = None, token_cache_skew_seconds: int = 5, token_cache_max_size: Optional[int] = None):
         """Configure runtime settings, OAuth client resolution, authorization, and exchange clients."""
         if config_overrides is not None and not isinstance(config_overrides, dict):
             raise TypeError("TokenFactory expects no positional argument or a config overrides dict.")
@@ -156,6 +155,7 @@ class TokenFactory:
             runtime_config = TokenFactoryRuntimeConfig.from_env(config_overrides)
 
         self._runtime_config = runtime_config
+        self._identity_domain_metadata = discover_identity_domain_metadata(runtime_config.domain_url, runtime_config.timeout_seconds, token_validation_session)
         self._authz_policy_enable = runtime_config.authz_policy_enable
         self._oauth_client_resolver = oauth_client_resolver or _resolver_from_oauth_apps(
             oauth_apps,
@@ -171,6 +171,7 @@ class TokenFactory:
         self._db_token_generator = db_token_generator
         self._factory_oci_signer_builder = factory_oci_signer_builder
         self._oci_signer_builder = oci_signer_builder
+        self._jwt_assertion_signer = jwt_assertion_signer
         self._token_cache_enabled = runtime_config.cache_enable if token_cache_enabled is None else bool(token_cache_enabled)
         resolved_cache_max_size = runtime_config.cache_max_size if token_cache_max_size is None else token_cache_max_size
         self._token_cache = token_cache or TokenResultCache(resolved_cache_max_size)
@@ -206,7 +207,7 @@ class TokenFactory:
 
         signer_credential = self._resolve_oci_credential(credential)
         signer = self._oci_signer_builder(signer_credential)
-        endpoint = f"{self._runtime_config.domain_url}/oauth2/v1/token"
+        endpoint = self._identity_domain_metadata.token_endpoint
         request_data = {
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
@@ -262,7 +263,6 @@ class TokenFactory:
         requested_scope = _require_scope(scope, "oracle-database")
         selector = _oracle_database_credential_selector(credential)
         if selector == ORACLE_DATABASE_CREDENTIAL_OCI_PRINCIPAL:
-            _require_oci_principal_database_auth_mode(self._runtime_config)
             cache_key = _cache_key("oracle-database-oci-principal", requested_scope, self._runtime_config.oci_auth_mode, self._runtime_config.domain_url, self._runtime_config.domain_region)
             cached = self._get_cached_result(cache_key, "oracle-database-oci-principal")
             if cached is not None:
@@ -317,7 +317,7 @@ class TokenFactory:
         return self._token_cache.set(cache_key, result, expires_at_epoch, int(time.time()), self._token_cache_skew_seconds)
 
     def _validate_assertion(self, credential: str, client_key: str) -> CallerContext:
-        hosting_component = self._resolve_hosting_component(client_key)
+        hosting_component = self._resolve_hosting_component(client_key, require_signing_material=self._jwt_assertion_signer is None)
         validated = self._get_token_validator().validate(credential, hosting_component)
         subject = validated.claims.get(self._runtime_config.subject_claim)
         if not subject:
@@ -333,8 +333,11 @@ class TokenFactory:
 
     def _get_token_validator(self) -> Any:
         if self._token_validator is None:
+            claim_overrides = [self._runtime_config.groups_claim or "groups"]
             self._token_validator = _default_token_validator(
                 self._runtime_config,
+                claim_overrides,
+                self._identity_domain_metadata,
                 self._token_validation_session,
             )
         return self._token_validator
@@ -361,23 +364,28 @@ class TokenFactory:
 
     def _build_jwt_assertion(self, subject: str, hosting_component: ResolvedHostingComponent, token_type: str) -> str:
         identity = hosting_component.oauth_identity
-        issuer, private_key_pem = _require_signing_identity(identity, hosting_component.client_key)
+        if not identity.issuer:
+            raise OAuthClientResolutionError(f"OAuth client '{hosting_component.client_key}' is missing issuer.")
+        issuer = identity.issuer
         now = int(time.time())
         payload = {
             "iss": issuer,
             "sub": subject,
-            "aud": _jwt_audience(self._runtime_config, token_type),
+            "aud": _jwt_audience(self._identity_domain_metadata, token_type),
             "iat": now,
             "exp": now + 300,
             "jti": str(uuid.uuid4()),
         }
         payload.update(_propagation_trust_claim(hosting_component, token_type))
-        headers = {"typ": "JWT"}
+        headers = {"alg": "RS256", "typ": "JWT"}
         if identity.kid:
             headers["kid"] = identity.kid
 
-        key = _load_private_key(private_key_pem, identity.private_key_passphrase)
-        return jwt.encode(payload, key=key, algorithm="RS256", headers=headers)
+        if self._jwt_assertion_signer is not None:
+            return _sign_compact_jws(headers, payload, self._jwt_assertion_signer)
+        if not identity.kms_key_id or not identity.kms_key_version_id or not identity.kms_crypto_endpoint:
+            raise OAuthClientResolutionError(f"OAuth client '{hosting_component.client_key}' requires KMS key ID, key version ID, and cryptographic endpoint.")
+        return _sign_compact_jws(headers, payload, KmsJwtSigner(identity.kms_key_id, identity.kms_key_version_id, identity.kms_crypto_endpoint, self._factory_oci_signer_builder, self._runtime_config))
 
     def _exchange_assertion_for_oauth(self, assertion: str, scope: Optional[str], hosting_component: ResolvedHostingComponent) -> Dict[str, Any]:
         identity = hosting_component.oauth_identity
@@ -390,7 +398,7 @@ class TokenFactory:
             request_data["scope"] = scope
 
         response = self._token_endpoint_session.post(
-            f"{self._runtime_config.domain_url}/oauth2/v1/token",
+            self._identity_domain_metadata.token_endpoint,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Authorization": f"Basic {credentials}",
@@ -408,7 +416,7 @@ class TokenFactory:
             request_data["scope"] = scope
 
         response = self._token_endpoint_session.post(
-            f"{self._runtime_config.domain_url}/oauth2/v1/token",
+            self._identity_domain_metadata.token_endpoint,
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Authorization": f"Basic {credentials}",
@@ -437,10 +445,9 @@ class TokenFactory:
 
     def _build_upst_signer(self, assertion: str, hosting_component: ResolvedHostingComponent) -> Any:
         identity = hosting_component.oauth_identity
-        domain_id = _extract_identity_domain_id(self._runtime_config.domain_url)
         return self._token_exchange_signer_cls(
             assertion,
-            domain_id,
+            self._identity_domain_metadata.token_endpoint,
             identity.client_id,
             identity.client_secret,
             region=self._runtime_config.domain_region,
@@ -487,9 +494,6 @@ def _oauth_app_uses_vault(info: OAuthClientInfo) -> bool:
     return any(
         [
             info.client_credentials_secret_ocid,
-            info.private_key_secret_ocid,
-            info.private_key_passphrase_secret_ocid,
-            info.certificate_secret_ocid,
         ]
     )
 
@@ -529,15 +533,6 @@ def _oracle_database_credential_selector(credential: Credential) -> Optional[str
     if normalized in _ORACLE_DATABASE_CREDENTIAL_SELECTORS:
         return normalized
     return None
-
-
-def _require_oci_principal_database_auth_mode(runtime_config: TokenFactoryRuntimeConfig) -> None:
-    oci_auth_mode = str(runtime_config.oci_auth_mode or "").strip().lower()
-    if oci_auth_mode in {"", "instance-principal", "resource-principal"}:
-        return
-    raise ConfigurationError(
-        "oracle-database credential selector 'OCI_PRINCIPAL' supports only TF_SHARED_OCI_AUTH_MODE=instance-principal or resource-principal."
-    )
 
 
 def _generate_database_session_keypair_pem() -> Tuple[str, str]:
@@ -586,11 +581,10 @@ def _default_policy_provider(runtime_config: TokenFactoryRuntimeConfig) -> Autho
     return VaultJsonAuthorizationPolicyProvider(runtime_config.authz_policy_secret_ocid, read_secret)
 
 
-def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, session: Any = requests) -> Any:
-    claim_overrides = [runtime_config.groups_claim or "groups"]
-    trusted_issuers = _discover_jwt_trusted_issuers(runtime_config, claim_overrides, session)
+def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, claim_overrides: list[str], metadata: IdentityDomainMetadata, session: Any = requests) -> Any:
+    trusted_issuers = _trusted_issuers_from_metadata(metadata, claim_overrides)
     return HybridTokenValidator(
-        domain_url=runtime_config.domain_url,
+        introspection_endpoint=metadata.introspection_endpoint,
         trusted_issuers=trusted_issuers,
         jwt_claim_overrides=claim_overrides,
         timeout_seconds=runtime_config.timeout_seconds,
@@ -598,27 +592,10 @@ def _default_token_validator(runtime_config: TokenFactoryRuntimeConfig, session:
     )
 
 
-def _discover_jwt_trusted_issuers(runtime_config: TokenFactoryRuntimeConfig, required_claims: list[str], session: Any = requests) -> Dict[str, Dict[str, Any]]:
-    discovery_url = f"{runtime_config.domain_url.rstrip('/')}/.well-known/openid-configuration"
-    try:
-        response = session.get(discovery_url, timeout=runtime_config.timeout_seconds)
-        metadata = response.json()
-    except Exception as exc:
-        raise ConfigurationError(f"OIDC discovery failed: {exc}") from exc
-    if not getattr(response, "ok", True):
-        raise ConfigurationError(
-            f"OIDC discovery failed [{getattr(response, 'status_code', 'unknown')}]: {getattr(response, 'text', '')}"
-        )
-    if not isinstance(metadata, dict):
-        raise ConfigurationError("OIDC discovery response must be a JSON object.")
-
-    issuer = str(metadata.get("issuer") or "").strip()
-    jwks_url = str(metadata.get("jwks_uri") or "").strip()
-    if not issuer or not jwks_url:
-        raise ConfigurationError("OIDC discovery response must include issuer and jwks_uri.")
+def _trusted_issuers_from_metadata(metadata: IdentityDomainMetadata, required_claims: list[str]) -> Dict[str, Dict[str, Any]]:
     return {
-        issuer: {
-            "jwks_url": jwks_url,
+        metadata.issuer: {
+            "jwks_url": metadata.jwks_uri,
             "algorithms": ["RS256"],
             "required_claims": required_claims,
         }
@@ -658,6 +635,25 @@ def _copy_cached_result(result: Any) -> Any:
 def _cache_key(*parts: Any) -> str:
     """Build a deterministic cache key from non-secret or pre-fingerprinted parts."""
     return hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+
+
+def _sign_compact_jws(headers: Dict[str, Any], payload: Dict[str, Any], signer: Any) -> str:
+    """Build an RS256 compact JWS with a signature produced outside the process."""
+    encoded_header = _base64url_json(headers)
+    encoded_payload = _base64url_json(payload)
+    signing_input = f"{encoded_header}.{encoded_payload}".encode("ascii")
+    signature = signer.sign(signing_input)
+    if not isinstance(signature, bytes):
+        raise TokenExchangeError("JWT signer must return signature bytes.")
+    return f"{encoded_header}.{encoded_payload}.{_base64url(signature)}"
+
+
+def _base64url_json(value: Dict[str, Any]) -> str:
+    return _base64url(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
 def _cache_key_hint(key: str) -> str:
@@ -752,9 +748,9 @@ def _resource_audience_for_request_scope(scope: str) -> Optional[str]:
     return None
 
 
-def _jwt_audience(runtime_config: TokenFactoryRuntimeConfig, token_type: str) -> str:
+def _jwt_audience(metadata: IdentityDomainMetadata, token_type: str) -> str:
     if token_type in {"oracle-database", "oci-service"}:
-        return f"{runtime_config.domain_url}/oauth2/v1/token"
+        return metadata.token_endpoint
     return OCI_IDENTITY_AUDIENCE
 
 
@@ -767,23 +763,6 @@ def _propagation_trust_claim(hosting_component: ResolvedHostingComponent, token_
     if separator != ":" or not claim_name.strip() or not claim_value.strip():
         raise ConfigurationError("TF_CLIENT_PROPAGATION_TRUST_CLAIM must be formatted as claim_name:claim_value")
     return {claim_name.strip(): claim_value.strip()}
-
-
-def _require_signing_identity(identity: Any, client_key: str) -> Tuple[str, str]:
-    if not identity.issuer:
-        raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing issuer.")
-    if not identity.private_key_pem:
-        raise OAuthClientResolutionError(f"OAuth client '{client_key}' is missing private key.")
-    return identity.issuer, identity.private_key_pem
-
-
-def _load_private_key(private_key_pem: str, passphrase: Optional[str]):
-    password = passphrase.encode("utf-8") if passphrase else None
-    return serialization.load_pem_private_key(
-        private_key_pem.encode("utf-8"),
-        password=password,
-        backend=default_backend(),
-    )
 
 
 def _expires_in(token: str) -> int:

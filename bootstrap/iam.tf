@@ -19,7 +19,7 @@ resource "oci_identity_group" "these" {
 
 resource "oci_identity_policy" "these" {
   provider = oci.home
-  for_each = var.oauth_apps
+  for_each = local.secret_access_components
 
   compartment_id = var.oci_secrets_compartment_ocid
   description    = local.descriptions.oauth_apps[each.key].policy
@@ -31,8 +31,26 @@ resource "oci_identity_policy" "database_access" {
   provider = oci.home
   for_each = local.database_access_components
 
-  compartment_id = each.value.runtime.database_access.target_database_compartment_ocid
+  compartment_id = each.value.database_access.target_database_compartment_ocid
   description    = local.descriptions.oauth_apps[each.key].database_access_policy
   name           = local.names.oauth_apps[each.key].database_access_policy
   statements     = local.database_access_policy_statements[each.key]
+}
+
+resource "oci_identity_policy" "signing_key" {
+  provider = oci.home
+  for_each = var.oauth_apps
+
+  compartment_id = local.signing_key_compartment_ids[each.key]
+  description    = "Token Factory KMS signing-key use for ${each.key}."
+  name           = "${local.normalized_oauth_app_resource_names[each.key]}-signing-key-policy"
+  statements     = [local.signing_key_policy_statements[each.key]]
+}
+
+resource "oci_containerengine_cluster_workload_mapping" "these" {
+  for_each = local.oke_workload_mappings
+
+  cluster_id            = each.value.cluster_ocid
+  namespace             = each.value.namespace
+  mapped_compartment_id = var.oci_secrets_compartment_ocid
 }

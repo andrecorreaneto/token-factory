@@ -11,7 +11,6 @@ resource_name_prefix   = "token-factory"
 
 enable_oci_secrets                     = true
 oci_secrets_compartment_ocid           = "ocid1.compartment.oc1..replace-with-secrets-compartment-ocid"
-restrict_secret_policy_to_secret_ocids = true
 
 # Optional existing Vault/key. Omit both to create shared Vault storage.
 # oci_vault_existing_ocid      = "ocid1.vault.oc1..replace-with-vault"
@@ -48,35 +47,27 @@ oauth_apps = {
     allowed_scopes     = []
     app_roles          = []
 
-    runtime = {
-      principal_type   = "compute-instance"
-      compartment_ocid = "ocid1.compartment.oc1..replace-with-runtime-compartment-ocid"
-      resource_ocid    = "ocid1.instance.oc1..replace-with-compute-instance-ocid"
-      oci_auth_profile = null
-      oci_region       = null
+    compute_runtime = {
+      instance_ocid = "ocid1.instance.oc1..replace-with-compute-instance-ocid"
+    }
 
-      # Optional. Enable only when this runtime should request Oracle Database
-      # db-tokens with TokenFactory credential="OCI_PRINCIPAL".
-      database_access = {
-        target_database_compartment_ocid = "ocid1.compartment.oc1..replace-with-database-compartment-ocid"
-        target_database_ocid             = "ocid1.autonomousdatabase.oc1..replace-with-database-ocid"
-      }
+    # Optional for every runtime type. Creates only OCI-side database token access.
+    database_access = {
+      target_database_compartment_ocid = "ocid1.compartment.oc1..replace-with-database-compartment-ocid"
+      target_database_ocid             = "ocid1.autonomousdatabase.oc1..replace-with-database-ocid"
     }
 
     enable_identity_propagation_trust = true
     propagation_trust_claim_name      = "upstclient"
     propagation_trust_claim_value     = "tokenexchange"
 
-    jwt_key_material_source = "generate"
-
-    jwt_private_key_pem                     = null
-    jwt_private_key_passphrase              = null
-    jwt_certificate_pem                     = null
-    jwt_certificate_pem_for_identity_domain = null
-
-    private_key_secret_existing_ocid            = null
-    private_key_passphrase_secret_existing_ocid = null
-    certificate_secret_existing_ocid            = null
+    signing_key = {
+      mode                     = "BOOTSTRAP_MANAGED"
+      signing_key_ocid         = null
+      signing_key_version_ocid = null
+      signing_certificate_pem  = null
+      signing_certificate_path = null
+    }
   }
 }
 

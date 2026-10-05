@@ -49,8 +49,6 @@ Adding a new hosting application should be additive: add one `oauth_apps` entry 
 | `oci_secrets_compartment_ocid` | `string` | `null` | Conditional | Compartment for created or existing OCI Secrets and runtime secret-read policies. Required when secrets are enabled. |
 | `oci_vault_existing_ocid` | `string` | `null` | No | Existing Vault OCID. When omitted and secrets are enabled, the module provisions a Vault. |
 | `oci_master_key_existing_ocid` | `string` | `null` | No | Existing Vault master key OCID. When omitted and secrets are enabled, the module provisions a key. |
-| `oci_secrets_region` | `string` | `null` | No | Fallback OCI Secrets region for runtime config. Defaults to `identity_domain_region` when omitted. |
-| `restrict_secret_policy_to_secret_ocids` | `bool` | `false` | No | When true, generated Vault read policies include where clauses for individual secret OCIDs. |
 
 ### Runtime Config Inputs
 
@@ -87,32 +85,28 @@ Map keys are the canonical Token Factory `CallerContext.client_key` values and m
 
 | Field | Required? | Description |
 | --- | --- | --- |
-| `resource_name_prefix` | No | Optional prefix for this app's resources. Defaults to the normalized map key, for example `MCP_SERVER` becomes `mcp-server`. |
+| `resource_name_prefix` | No | Optional prefix for this app's resources. Defaults to normalized `display_name`; the map key remains only the Terraform identity. |
 | `display_name` | Yes | Identity Domain confidential app display name. |
 | `description` | No | Identity Domain confidential app description. |
 | `issuer` | Yes | JWT assertion issuer for this OAuth app/client identity. |
 | `kid` | Yes | JWT key ID and OAuth partner certificate alias. |
 | `resource_audiences` | Yes | Accepted incoming token audiences for this hosting app/resource server. |
 | `resource_scopes` | No | Incoming Identity Domain resource-server scopes. Non-empty values make the Identity Domain app an OAuth resource. |
-| `allowed_scopes` | No | OAuth client authorized scopes for the Identity Domain app. Values must be Identity Domain FQS strings. |
+| `allowed_scopes` | No | OAuth client authorized scopes for the Identity Domain app. Values must be Identity Domain FQS strings. Apps with allowed scopes are created after scope-independent apps so module-managed resource scopes exist first. |
 | `app_roles` | No | Identity Domain app-role grants for the OAuth app. Defaults to no grants. |
-| `runtime.principal_type` | Yes | `compute-instance`, `oci-function`, `oke-cluster`, or `user-group`. |
-| `runtime.compartment_ocid` | Yes | Compartment for dynamic group matching or group/policy placement. |
-| `runtime.resource_ocid` | No | Optional exact compute instance, OCI Function, or OKE cluster OCID. |
-| `runtime.oci_auth_profile` | No | Used only when `principal_type = "user-group"`; defaults to `DEFAULT` in runtime config. |
-| `runtime.oci_region` | No | Per-runtime `TF_SHARED_OCI_REGION`; falls back to `oci_secrets_region` or `identity_domain_region`. |
-| `runtime.database_access` | No | Optional object that creates a compartment-scoped IAM policy allowing the runtime dynamic group to use `database-connections` for one target database. |
+| `compute_runtime` | Exactly one runtime | Exact Compute workload object containing `instance_ocid`. |
+| `function_runtime` | Exactly one runtime | Exact Functions workload object containing `function_ocid`. |
+| `oke_runtime` | Exactly one runtime | OKE workload identity containing `cluster_ocid`, `namespace`, and `service_account`. |
+| `local_runtime` | Exactly one runtime | Local/API-key runtime with optional `oci_auth_profile`, defaulting to `DEFAULT`; discouraged for OCI-hosted workloads. |
+| `database_access` | No | Runtime-independent sibling that creates a target-database-scoped `database-connections` policy and emits database-owner guidance. |
 | `enable_identity_propagation_trust` | No | Create IdentityPropagationTrust for `oracle-database` and `oci-service` UPST flows. Defaults to true. |
 | `propagation_trust_claim_name` | No | Optional trust client claim name. Must be set with `propagation_trust_claim_value`. |
 | `propagation_trust_claim_value` | No | Optional trust client claim value. Must be set with `propagation_trust_claim_name`. |
-| `jwt_key_material_source` | No | `generate`, `provided_pem`, or `existing_secret_ocids`. Defaults to `generate`. |
-| `jwt_private_key_pem` | Conditional | Private key PEM. Required when `jwt_key_material_source = "provided_pem"`. Sensitive. |
-| `jwt_private_key_passphrase` | No | Optional private key passphrase. Sensitive. |
-| `jwt_certificate_pem` | Conditional | Certificate PEM. Required when `jwt_key_material_source = "provided_pem"`. Sensitive. |
-| `jwt_certificate_pem_for_identity_domain` | Conditional | Public certificate PEM for Identity Domains when using existing secret OCIDs. |
-| `private_key_secret_existing_ocid` | Conditional | Existing private key secret OCID when `jwt_key_material_source = "existing_secret_ocids"`. |
-| `private_key_passphrase_secret_existing_ocid` | No | Optional existing private key passphrase secret OCID. |
-| `certificate_secret_existing_ocid` | Conditional | Existing certificate secret OCID when `jwt_key_material_source = "existing_secret_ocids"`. |
+| `signing_key.mode` | Yes | `BOOTSTRAP_MANAGED` creates a non-exportable RSA KMS key and registers its KMS-signed certificate. `EXTERNALLY_MANAGED` references an existing key/version. |
+| `signing_key.signing_key_ocid` | External mode | Existing asymmetric KMS key OCID. |
+| `signing_key.signing_key_version_ocid` | External mode; optional managed rotation | Exact KMS key-version OCID. Managed mode defaults to the created key's current version and accepts an explicit rotated version. |
+| `signing_key.signing_certificate_pem` | External mode | Public certificate PEM; mutually exclusive with `signing_certificate_path`. |
+| `signing_key.signing_certificate_path` | External mode | Public certificate file path; mutually exclusive with `signing_certificate_pem`. |
 
 Supported `app_roles` values are Identity Domain app role display names validated by the module, such as `Me`, `User Administrator`, `Security Administrator`, and `Application Administrator`.
 
@@ -125,38 +119,37 @@ The top-level `resource_name_prefix` defaults to `token-factory`. It affects sha
 | `oci_kms_vault.this` | `token-factory-vault` | When `enable_oci_secrets = true` and `oci_vault_existing_ocid = null`. |
 | `oci_kms_key.this` | `token-factory-master-key` | When `enable_oci_secrets = true` and `oci_master_key_existing_ocid = null`. |
 
-Per-app resources use `oauth_apps[*].resource_name_prefix`. When it is omitted, the module normalizes the `oauth_apps` map key.
+Per-app resources use `oauth_apps[*].resource_name_prefix`. When it is omitted or empty, the module normalizes the app `display_name`.
 
 For `MCP_SERVER`, the default per-app prefix is `mcp-server`.
 
 | Resource | Example generated value | When it applies |
 | --- | --- | --- |
-| `oci_identity_domains_app.these` | `mcp-server-client` | For each `oauth_apps` entry. |
+| `oci_identity_domains_app.these` | `mcp-server-client` | For apps without `allowed_scopes`. |
+| `oci_identity_domains_app.scope_consumers` | `agent-client` | For apps with `allowed_scopes`, after scope-independent apps. |
 | `oci_identity_domains_identity_propagation_trust.these` | `mcp-server-identity-propagation-trust` | When propagation trust is enabled for the app. |
-| `oci_identity_dynamic_group.these` | `mcp-server-runtime-dynamic-group` | For compute, function, and OKE runtimes when `identity_domain_url` resolves to the Default domain. |
+| `oci_identity_dynamic_group.these` | `mcp-server-runtime-dynamic-group` | For exact Compute and Function runtimes when `identity_domain_url` resolves to the Default domain. |
 | `oci_identity_group.these` | `mcp-server-runtime-user-group` | For `user-group` runtimes when `identity_domain_url` resolves to the Default domain. |
-| `oci_identity_domains_dynamic_resource_group.these` | `mcp-server-runtime-dynamic-group` | For compute, function, and OKE runtimes when `identity_domain_url` resolves to a custom Identity Domain. |
+| `oci_identity_domains_dynamic_resource_group.these` | `mcp-server-runtime-dynamic-group` | For exact Compute and Function runtimes when `identity_domain_url` resolves to a custom Identity Domain. |
 | `oci_identity_domains_group.these` | `mcp-server-runtime-user-group` | For `user-group` runtimes when `identity_domain_url` resolves to a custom Identity Domain. |
 | `oci_identity_policy.these` | `mcp-server-secrets-policy` | For each app runtime. |
-| `oci_identity_policy.database_access` | `mcp-server-database-access-policy` | When `runtime.database_access` is set. |
+| `oci_identity_policy.database_access` | `mcp-server-database-access-policy` | When sibling `database_access` is set. |
 | `oci_vault_secret.client_credentials` | `mcp-server-client-credentials-secret` | When `enable_oci_secrets = true`. |
-| `oci_vault_secret.private_keys` | `mcp-server-jwt-private-key-secret` | When secrets are enabled and key material is generated or provided. |
-| `oci_vault_secret.private_key_passphrases` | `mcp-server-jwt-private-key-passphrase-secret` | When a passphrase secret is needed. |
-| `oci_vault_secret.certificates` | `mcp-server-jwt-certificate-secret` | When secrets are enabled and key material is generated or provided. |
+| `oci_kms_key.signing` | `mcp-server-jwt-signing-key` | For each `BOOTSTRAP_MANAGED` app. Private key material never leaves KMS. |
 
 ## Module Outputs
 
 | Output | Description |
 | --- | --- |
 | `shared_runtime_config` | Shared Token Factory runtime config object. |
-| `clients_runtime_config` | Per-client non-sensitive OAuth resolver config with secret OCID references and optional database setup commands. |
+| `clients_runtime_config` | Per-client runtime config with client-credential Secret references, version-pinned KMS signing metadata, and optional database guidance. |
 | `provisioned_resources` | Shared and OAuth app/runtime resources with names, OCIDs/IDs, generated policy statements, and selected Identity Domain metadata. |
 
 Regular outputs intentionally avoid inline credentials and PEM values. Direct-value resolver outputs are marked sensitive.
 
 ## Vault and Secrets
 
-Vault-backed mode is the default. Set `enable_oci_secrets = true` and provide `oci_secrets_compartment_ocid`.
+Every OAuth app requires a shared OCI Vault for its asymmetric signing key. Set `enable_oci_secrets = true` when client credentials should also be stored as Vault Secrets.
 
 The module can create a Vault and master key, or use existing ones:
 
@@ -175,38 +168,42 @@ Providing `oci_master_key_existing_ocid` without `oci_vault_existing_ocid` is in
 
 Vault-backed deployments should use `shared_runtime_config` plus `clients_runtime_config[<client_key>]`. Callers can derive shell export lines from `shared_runtime_config` when a hosting runtime is configured through environment variables.
 
-Direct-value deployments set `enable_oci_secrets = false`. Prefer Vault-backed mode for production because the simplified output surface intentionally avoids inline credentials and PEM values.
+Direct client-credential deployments may set `enable_oci_secrets = false`; the Vault and constrained KMS IAM policies are still required for assertion signing.
 
-## Key Material Sources
+## KMS Signing Modes
 
-`jwt_key_material_source` is configured per OAuth app.
+`BOOTSTRAP_MANAGED` creates an RSA KMS key in the shared Vault. The certificate utility obtains the exact key-version public key, self-signs through KMS Sign, and idempotently registers the OAuth partner certificate. KMS and Identity Domains operations use the same OCI identity and API-key or workload signer configured for the Terraform bootstrap runner.
 
-Supported values:
+Install the repository `requirements.txt` into the interpreter selected by `certificate_registration_python_command` before apply. Generate a fresh plan after changing the command or utility wiring because a saved plan retains its provisioner command.
 
-- `generate`: Terraform generates an RSA private key and self-signed certificate.
-- `provided_pem`: callers provide `jwt_private_key_pem` and `jwt_certificate_pem`.
-- `existing_secret_ocids`: callers provide existing private key and certificate secret OCIDs plus `jwt_certificate_pem_for_identity_domain`.
+`EXTERNALLY_MANAGED` requires an existing key OCID, exact key-version OCID, and one public certificate input. Bootstrap verifies that the certificate public key matches the selected KMS key version before registering it through Terraform.
 
-When `enable_oci_secrets = false`, OCI secrets, runtime IAM groups, and runtime IAM policies are not created. In direct-value mode, Token Factory does not need OCI IAM access just to load its own configuration.
+Neither mode accepts or exports hosting private-key PEM.
+
+Managed signing keys disable automatic rotation. Rotate explicitly in KMS, set the new `signing_key_version_ocid` and a new `kid`, publish the new certificate, deploy the version-pinned runtime configuration, and retire the prior certificate only after the rollout completes. The key OCID and its constrained IAM policy remain stable, so old and new key versions can overlap safely.
+
+To retire the prior alias, invoke the certificate utility with `TF_CERT_ACTION=delete`, `TF_CERT_IDCS_ENDPOINT`, `TF_CERT_ALIAS`, and the bootstrap runner's OCI authentication environment after the rollout.
+
+When `enable_oci_secrets = false`, client-credential Secrets and their read policies are omitted. Runtime identity and constrained KMS `use keys` policies remain required.
 
 ## Runtime IAM
 
-Runtime IAM is configured per OAuth app with `oauth_apps[*].runtime.principal_type`.
+Runtime IAM is derived from the one configured runtime object. `TF_SHARED_OCI_REGION` uses top-level `region`, falling back to `identity_domain_region`; runtime objects do not override it.
 
-| `runtime.principal_type` | `TF_SHARED_OCI_AUTH_MODE` | Principal created |
+| Runtime object | `TF_SHARED_OCI_AUTH_MODE` | Principal created |
 | --- | --- | --- |
-| `compute-instance` | `instance-principal` | Dynamic group |
-| `oci-function` | `resource-principal` | Dynamic group |
-| `oke-cluster` | `resource-principal` | Dynamic group |
-| `user-group` | `oci-profile` | User group |
+| `compute_runtime` | `instance-principal` | Exact-instance dynamic group |
+| `function_runtime` | `resource-principal` | Exact-function dynamic group |
+| `oke_runtime` | `oke-workload-identity` | `any-user` policy constrained by cluster, namespace, and service account |
+| `local_runtime` | `oci-profile` | User group |
 
-Set `runtime.compartment_ocid` for every app. Optionally set `runtime.resource_ocid` to restrict dynamic group matching to one compute instance, OKE cluster, or OCI Function.
+Compute and Function runtime objects require an exact resource OCID. OKE uses its cluster/namespace/service-account workload tuple and does not create a dynamic group.
 
 For `user-group`, the module creates the group and policy but does not manage user membership. Add the intended API-key user through your normal IAM process.
 
 ### Oracle Database Token Access
 
-Set `oauth_apps[*].runtime.database_access` when the runtime should call:
+Set sibling `oauth_apps[*].database_access` when the runtime should call:
 
 ```python
 factory.get_token("oracle-database", "OCI_PRINCIPAL", db_scope, client_key="MCP_SERVER")
@@ -220,18 +217,11 @@ allow <dynamic-group-subject> to use database-connections in compartment id <tar
 
 Default-domain policies use unquoted group names. Custom Identity Domain policies use quoted domain-qualified names, for example `dynamic-group 'example-domain'/'mcp-server-runtime-dynamic-group'`.
 
-`runtime.database_access` is valid only for dynamic-group runtimes (`compute-instance`, `oci-function`, or `oke-cluster`), not `user-group`. `clients_runtime_config[<client_key>].database_access` also emits the database-side setup commands:
-
-```sql
-CREATE USER <SANITIZED_DB_USER> IDENTIFIED GLOBALLY AS 'IAM_GROUP_NAME=<identity-domain-name>/<dynamic-group-name>';
-GRANT CREATE SESSION TO <SANITIZED_DB_USER>;
-```
+`database_access` provisions only the OCI IAM policy required to request database tokens. `clients_runtime_config[<client_key>].database_access` reports the target database, generated policy statements, and a requirement note. Database authentication enablement, schema mapping, users, roles, and grants remain owned by the target database administrators.
 
 ## Security Notes
 
-Generated and provided private key material is stored in Terraform state. Prefer Vault-backed mode for production.
-
-Use `jwt_key_material_source = "existing_secret_ocids"` when Terraform should not handle raw private key material.
+Hosting private-key material is never accepted by the module; signing always uses an OCI KMS asymmetric key.
 
 `resource_scopes` are incoming resource-server scopes for the hosting application. They are not downstream scopes requested from target tools.
 

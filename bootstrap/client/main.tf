@@ -8,18 +8,16 @@ module "token_factory_bootstrap" {
   private_key_path     = var.private_key_path
   private_key_password = var.private_key_password
 
-  resource_name_prefix   = var.resource_name_prefix
-  identity_domain_compartment_ocid = var.identity_domain_compartment_ocid
-  identity_domain_url              = var.identity_domain_url
-  identity_domain_region           = var.identity_domain_region
+  resource_name_prefix                    = var.resource_name_prefix
+  identity_domain_compartment_ocid        = var.identity_domain_compartment_ocid
+  identity_domain_url                     = var.identity_domain_url
+  identity_domain_region                  = var.identity_domain_region
+  certificate_registration_python_command = var.certificate_registration_python_command
 
-  enable_oci_secrets                     = var.enable_oci_secrets
-  oci_secrets_compartment_ocid           = var.oci_secrets_compartment_ocid
-  oci_vault_existing_ocid                = var.oci_vault_existing_ocid
-  oci_master_key_existing_ocid           = var.oci_master_key_existing_ocid
-  oci_secrets_region                     = var.oci_secrets_region
-  restrict_secret_policy_to_secret_ocids = var.restrict_secret_policy_to_secret_ocids
-
+  enable_oci_secrets                         = var.enable_oci_secrets
+  oci_secrets_compartment_ocid               = var.oci_secrets_compartment_ocid
+  oci_vault_existing_ocid                    = var.oci_vault_existing_ocid
+  oci_master_key_existing_ocid               = var.oci_master_key_existing_ocid
   token_factory_timeout_seconds              = var.token_factory_timeout_seconds
   token_factory_subject_claim                = var.token_factory_subject_claim
   token_factory_groups_claim                 = var.token_factory_groups_claim

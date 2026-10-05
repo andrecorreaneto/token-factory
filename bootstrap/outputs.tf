@@ -10,14 +10,18 @@ output "clients_runtime_config" {
     key => {
       oauth_client_config = local.oauth_app_configs[key]
       database_access = contains(keys(local.database_access_components), key) ? {
-        commands_to_enable_db_authentication = local.database_access_requirement_commands[key]
+        target_database_compartment_ocid = component.database_access.target_database_compartment_ocid
+        target_database_ocid             = component.database_access.target_database_ocid
+        iam_policy_statements            = local.database_access_policy_statements[key]
+        database_configuration_required  = true
+        requirement_note                 = "Enable OCI IAM authentication and map the intended IAM identity to a database schema using a mapping supported by the target database service."
       } : null
     }
   }
 }
 
 output "provisioned_resources" {
-  description = "Provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database setup commands."
+  description = "Provisioned shared and OAuth app/runtime resources with names, OCIDs, policy statements, and database requirement guidance."
   value = var.output_provisioned_resources ? {
     identity_domain = {
       name       = local.selected_identity_domain_name
@@ -44,15 +48,27 @@ output "provisioned_resources" {
       for key, component in var.oauth_apps :
       key => {
         identity_domain_app = {
-          name           = oci_identity_domains_app.these[key].name
+          name           = local.identity_domain_apps[key].name
           display_name   = component.display_name
-          client_id      = oci_identity_domains_app.these[key].name
-          application_id = oci_identity_domains_app.these[key].id
-          ocid           = oci_identity_domains_app.these[key].ocid
+          client_id      = local.identity_domain_apps[key].name
+          application_id = local.identity_domain_apps[key].id
+          ocid           = local.identity_domain_apps[key].ocid
         }
         oauth_partner_certificate = {
           name = component.kid
-          ocid = oci_identity_domains_oauth_partner_certificate.these[key].ocid
+          ocid = component.signing_key.mode == "BOOTSTRAP_MANAGED" ? data.oci_identity_domains_oauth_partner_certificates.managed[key].oauth_partner_certificates[0].ocid : oci_identity_domains_oauth_partner_certificate.these[key].ocid
+        }
+        signing_key = {
+          mode             = component.signing_key.mode
+          key_ocid         = local.signing_key_ids[key]
+          key_version_ocid = local.signing_key_version_ids[key]
+          crypto_endpoint  = local.vault_crypto_endpoint
+          protection_mode  = component.signing_key.mode == "BOOTSTRAP_MANAGED" ? oci_kms_key.signing[key].protection_mode : data.oci_kms_key.external[key].protection_mode
+          access_policy = {
+            name       = "${local.normalized_oauth_app_resource_names[key]}-signing-key-policy"
+            ocid       = oci_identity_policy.signing_key[key].id
+            statements = [local.signing_key_policy_statements[key]]
+          }
         }
         identity_domain_app_role_grants = {
           for grant_key, grant in local.identity_domain_app_role_grants :
@@ -71,14 +87,14 @@ output "provisioned_resources" {
           id             = local.runtime_principal_ids[key]
           subject        = local.runtime_principal_subjects[key]
           principal_kind = local.runtime_principal_kinds[key]
-          principal_type = component.runtime.principal_type
-          matching_rule  = component.runtime.principal_type == "user-group" ? null : local.runtime_matching_rules[key]
+          principal_type = local.runtime_configs[key].principal_type
+          matching_rule  = try(local.runtime_matching_rules[key], null)
         }
-        vault_read_policy = {
+        vault_read_policy = contains(keys(local.secret_access_components), key) ? {
           name       = local.names.oauth_apps[key].policy
           ocid       = oci_identity_policy.these[key].id
           statements = local.secret_policy_statements[key]
-        }
+        } : null
         database_access_policy = contains(keys(local.database_access_components), key) ? {
           name       = local.names.oauth_apps[key].database_access_policy
           ocid       = oci_identity_policy.database_access[key].id
@@ -88,18 +104,6 @@ output "provisioned_resources" {
           client_credentials = {
             name = var.enable_oci_secrets ? local.names.oauth_apps[key].client_credentials : null
             ocid = local.client_credentials_secret_ocids[key]
-          }
-          private_key = {
-            name = var.enable_oci_secrets && component.jwt_key_material_source != "existing_secret_ocids" ? local.names.oauth_apps[key].private_key : null
-            ocid = local.private_key_secret_ocids[key]
-          }
-          private_key_passphrase = {
-            name = var.enable_oci_secrets && component.jwt_key_material_source != "existing_secret_ocids" && component.jwt_private_key_passphrase != null ? local.names.oauth_apps[key].private_key_passphrase : null
-            ocid = local.private_key_passphrase_secret_ocids[key]
-          }
-          certificate = {
-            name = var.enable_oci_secrets && component.jwt_key_material_source != "existing_secret_ocids" ? local.names.oauth_apps[key].certificate : null
-            ocid = local.certificate_secret_ocids[key]
           }
         }
       }
